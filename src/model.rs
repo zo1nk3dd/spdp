@@ -2,9 +2,124 @@ use std::fs;
 
 struct ModelRestricted {
     pub data : SPDPData,
-
+    fragments: Vec<Fragment>,
 }
 
+impl ModelRestricted {
+    fn generate_fragments(
+        &mut self,
+        path: Vec<Event>,
+        time: usize,
+        cost: usize,
+        to_treat: Vec<usize>,
+        to_empty: Vec<usize>,
+        done: Vec<usize>,
+        num_p: usize,
+    ) -> bool { 
+        if time > self.data.t_limit {
+            return false;
+        }
+
+        if to_treat.len() + to_empty.len() == 0 {
+            self.fragments.push(Fragment::new(path, time, cost, done));
+            return true;
+        }
+
+        let mut found_true = false;
+
+        for i in to_treat {
+            let next_event = Event { request_id: i, action: Action::Treat };
+            let mut new_path = path.clone();
+            new_path.push(next_event);
+            let new_time = time + self.time_between(path.last().unwrap(), &next_event);
+            let new_cost = cost + self.cost_between(path.last().unwrap(), &next_event);
+
+            let mut new_to_treat = to_treat.clone();
+            new_to_treat.retain(|&x| x != i);
+
+            let mut new_to_empty = to_empty.clone();
+            new_to_empty.push(i);
+
+            let mut new_done = done.clone();
+
+            
+
+        }
+
+        return true;
+    }
+
+    fn time_between(&self, a: &Event, b: &Event) -> usize {
+        let a_loc = match a.action {
+            Action::Pickup => self.data.requests[a.request_id].from_id,
+            Action::Treat => self.data.requests[a.request_id].to_id,
+            Action::Deliver => self.data.requests[a.request_id].from_id,
+            Action::PP => self.data.requests[a.request_id].from_id,
+        };
+        let b_loc = match b.action {
+            Action::Pickup => self.data.requests[b.request_id].from_id,
+            Action::Treat => self.data.requests[b.request_id].to_id,
+            Action::Deliver => self.data.requests[b.request_id].from_id,
+            Action::PP => self.data.requests[b.request_id].from_id,
+        };
+        self.data.time[a_loc][b_loc]
+    }
+
+    fn cost_between(&self, a: &Event, b: &Event) -> usize {
+        let a_loc = match a.action {
+            Action::Pickup => self.data.requests[a.request_id].from_id,
+            Action::Treat => self.data.requests[a.request_id].to_id,
+            Action::Deliver => self.data.requests[a.request_id].from_id,
+            Action::PP => self.data.requests[a.request_id].from_id,
+        };
+        let b_loc = match b.action {
+            Action::Pickup => self.data.requests[b.request_id].from_id,
+            Action::Treat => self.data.requests[b.request_id].to_id,
+            Action::Deliver => self.data.requests[b.request_id].from_id,
+            Action::PP => self.data.requests[b.request_id].from_id,
+        };
+        self.data.distance[a_loc][b_loc]
+    }
+
+    fn optimise_requests() {
+        // Organise the quantities
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Fragment {
+    pub events: Vec<Event>,
+    pub time: usize,
+    pub cost: usize,
+    pub done: Vec<usize>,
+}
+
+impl Fragment {
+    fn new(events:Vec<Event>, time: usize, cost: usize, done: Vec<usize>) -> Self {
+        Fragment {
+            events,
+            time,
+            cost,
+            done,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Event {
+    request_id: usize,
+    action: Action,
+}
+
+#[derive(Debug, Clone)]
+enum Action {
+    Pickup,
+    Treat,
+    Deliver,
+    PP
+}
+
+#[derive(Debug, Clone)]
 struct SPDPData {
     pub container_types: usize,
     pub waste_types: usize,
@@ -111,6 +226,7 @@ impl SPDPData {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Request {
     id: usize,
     waste_id: usize,
