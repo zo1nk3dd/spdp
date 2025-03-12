@@ -1,8 +1,8 @@
 use std::fs;
 
-struct ModelRestricted {
+pub struct ModelRestricted {
     pub data : SPDPData,
-    fragments: Vec<Fragment>,
+    pub fragments: Vec<Fragment>,
 }
 
 impl ModelRestricted {
@@ -14,7 +14,6 @@ impl ModelRestricted {
         };
 
         for request_id in 0..model.data.requests.len() {
-            let request = &model.data.requests[request_id];
             let path = vec![Event { request_id, action: Action::Pickup }];
             let time = model.data.t_pickup + model.data.t_empty + model.data.t_delivery;
             let cost = 0;
@@ -64,13 +63,17 @@ impl ModelRestricted {
             let mut new_to_empty = to_empty.clone();
             new_to_empty.push(*i);
 
-            let mut new_done = done.clone();
+            let new_done = done.clone();
 
             let result = self.generate_fragments(new_path, new_time, new_cost, new_to_treat, new_to_empty, new_done, num_p);
 
             if result {
                 found_true = true;
                 // todo add the optimization, how does return true work?
+                if path.last().unwrap().action == Action::Treat &&
+                        self.data.requests[path.last().unwrap().request_id].to_id == self.data.requests[*i].to_id {
+                    return true;
+                }
             }
         }
 
@@ -96,6 +99,11 @@ impl ModelRestricted {
             if result {
                 found_true = true;
                 // todo add the optimization, how does return true work?
+                // ig it just skips extending to pickup in this scenario by returning
+                if path.last().unwrap().action == Action::Deliver &&
+                        self.data.requests[path.last().unwrap().request_id].from_id == self.data.requests[*i].from_id {
+                    return true;
+                }
             }
         }
 
@@ -144,9 +152,9 @@ impl ModelRestricted {
 
                     let new_to_empty = to_empty.clone();
 
-                    let mut new_done = done.clone();
+                    let new_done = done.clone();
 
-                    let result = self.generate_fragments(new_path, new_time, new_cost, new_to_treat, new_to_empty, new_done, num_p + 1);
+                    self.generate_fragments(new_path, new_time, new_cost, new_to_treat, new_to_empty, new_done, num_p + 1);
                 }
             }
 
@@ -160,13 +168,13 @@ impl ModelRestricted {
             Action::Pickup => self.data.requests[a.request_id].from_id,
             Action::Treat => self.data.requests[a.request_id].to_id,
             Action::Deliver => self.data.requests[a.request_id].from_id,
-            Action::PP => self.data.requests[a.request_id].from_id,
+            Action::_PP => self.data.requests[a.request_id].from_id,
         };
         let b_loc = match b.action {
             Action::Pickup => self.data.requests[b.request_id].from_id,
             Action::Treat => self.data.requests[b.request_id].to_id,
             Action::Deliver => self.data.requests[b.request_id].from_id,
-            Action::PP => self.data.requests[b.request_id].from_id,
+            Action::_PP => self.data.requests[b.request_id].from_id,
         };
         self.data.time[a_loc][b_loc]
     }
@@ -176,24 +184,20 @@ impl ModelRestricted {
             Action::Pickup => self.data.requests[a.request_id].from_id,
             Action::Treat => self.data.requests[a.request_id].to_id,
             Action::Deliver => self.data.requests[a.request_id].from_id,
-            Action::PP => self.data.requests[a.request_id].from_id,
+            Action::_PP => self.data.requests[a.request_id].from_id,
         };
         let b_loc = match b.action {
             Action::Pickup => self.data.requests[b.request_id].from_id,
             Action::Treat => self.data.requests[b.request_id].to_id,
             Action::Deliver => self.data.requests[b.request_id].from_id,
-            Action::PP => self.data.requests[b.request_id].from_id,
+            Action::_PP => self.data.requests[b.request_id].from_id,
         };
         self.data.distance[a_loc][b_loc]
-    }
-
-    fn optimise_requests() {
-        // Organise the quantities
     }
 }
 
 #[derive(Debug, Clone)]
-struct Fragment {
+pub struct Fragment {
     pub events: Vec<Event>,
     pub time: usize,
     pub cost: usize,
@@ -212,7 +216,7 @@ impl Fragment {
 }
 
 #[derive(Debug, Clone)]
-struct Event {
+pub struct Event {
     request_id: usize,
     action: Action,
 }
@@ -222,11 +226,11 @@ enum Action {
     Pickup,
     Treat,
     Deliver,
-    PP
+    _PP
 }
 
 #[derive(Debug, Clone)]
-struct SPDPData {
+pub struct SPDPData {
     pub container_types: usize,
     pub waste_types: usize,
     pub locations: usize,
@@ -255,7 +259,6 @@ impl SPDPData {
 
         let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
         assert_eq!(name, "CONTAINER_TYPES");
-        println!("{num}");
         let container_types: usize = num.trim().parse().unwrap();
 
         let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
@@ -292,12 +295,38 @@ impl SPDPData {
 
         lines.next();
 
-        let requests: Vec<Request> = (0..num_requests)
+        let mut requests: Vec<Request> = (0..num_requests)
             .map(|_| {
                 let data = lines.next().unwrap();
                 Request::from_line(data)
                 }
             ).collect();
+
+        println!("Requests: {:?}", requests.len());
+
+        let mut new_requests = Vec::new();
+
+        for r in &requests {
+            if new_requests.iter().any(|x: &Request| x.from_id == r.from_id && x.to_id == r.to_id) {
+                continue;
+            }
+            let mut count = 0;
+
+            for r2 in &requests {
+                if r.from_id == r2.from_id && r.to_id == r2.to_id {
+                    count += 1;
+                }
+            }
+
+            let mut new_request = r.clone();
+            new_request.quantity = count;
+
+            new_requests.push(new_request);
+        }    
+
+        println!("New Requests: {:?}", new_requests.len());
+        
+        requests = new_requests;
 
         assert!(lines.next().unwrap().starts_with("Distance"));
 
@@ -333,12 +362,12 @@ impl SPDPData {
 }
 
 #[derive(Debug, Clone)]
-struct Request {
-    id: usize,
-    waste_id: usize,
+pub struct Request {
+    _id: usize,
+    _waste_id: usize,
     from_id: usize,
-    container_type: usize,
-    to_num: usize,
+    _container_type: usize,
+    _to_num: usize,
     to_id: usize,
     quantity: usize,
 }
@@ -355,11 +384,11 @@ impl Request {
         let to_id = data.next().unwrap().parse().unwrap();
 
         Request {
-            id,
-            waste_id,
+            _id: id,
+            _waste_id: waste_id,
             from_id,
-            container_type,
-            to_num,
+            _container_type: container_type,
+            _to_num: to_num,
             to_id,
             quantity: 1,
         }
@@ -374,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_load_data() {
-        let spdp = SPDPData::from_file("./Data/SkipData/Benchmark/RecDep_day_A1.dat");
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A1.dat");
 
         assert_eq!(spdp.container_types, 9);
         assert_eq!(spdp.waste_types, 29);
@@ -390,5 +419,21 @@ mod tests {
         assert_eq!(spdp.time.len(), 23);
         assert_eq!(spdp.requests[0].from_id, 5);
         assert_eq!(spdp.requests[0].to_id, 14);
+    }
+
+    #[test]
+
+    fn test_fragment() {
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A1.dat");
+        let model = ModelRestricted::new(spdp);
+        assert_eq!(model.fragments.len(), 145);
+
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_D20.dat");
+        let model = ModelRestricted::new(spdp);
+        assert_eq!(model.fragments.len(), 130444);
+
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_C6.dat");
+        let model = ModelRestricted::new(spdp);
+        assert_eq!(model.fragments.len(), 1920);
     }
 }
