@@ -6,6 +6,29 @@ struct ModelRestricted {
 }
 
 impl ModelRestricted {
+
+    pub fn new(data: SPDPData) -> Self {
+        let mut model = ModelRestricted {
+            data,
+            fragments: Vec::new(),
+        };
+
+        for request_id in 0..model.data.requests.len() {
+            let request = &model.data.requests[request_id];
+            let path = vec![Event { request_id, action: Action::Pickup }];
+            let time = model.data.t_pickup + model.data.t_empty + model.data.t_delivery;
+            let cost = 0;
+            let to_treat = vec![request_id];
+            let to_empty = Vec::new();
+            let done = Vec::new();
+            let num_p = 1;
+
+            model.generate_fragments(path, time, cost, to_treat, to_empty, done, num_p);
+        }
+
+        model
+    }
+
     fn generate_fragments(
         &mut self,
         path: Vec<Event>,
@@ -27,22 +50,105 @@ impl ModelRestricted {
 
         let mut found_true = false;
 
-        for i in to_treat {
-            let next_event = Event { request_id: i, action: Action::Treat };
-            let mut new_path = path.clone();
-            new_path.push(next_event);
+        for i in &to_treat {
+            let next_event = Event { request_id: *i, action: Action::Treat };
             let new_time = time + self.time_between(path.last().unwrap(), &next_event);
             let new_cost = cost + self.cost_between(path.last().unwrap(), &next_event);
 
+            let mut new_path = path.clone();
+            new_path.push(next_event);
+
             let mut new_to_treat = to_treat.clone();
-            new_to_treat.retain(|&x| x != i);
+            new_to_treat.retain(|&x| x != *i);
 
             let mut new_to_empty = to_empty.clone();
-            new_to_empty.push(i);
+            new_to_empty.push(*i);
 
             let mut new_done = done.clone();
 
-            
+            let result = self.generate_fragments(new_path, new_time, new_cost, new_to_treat, new_to_empty, new_done, num_p);
+
+            if result {
+                found_true = true;
+                // todo add the optimization, how does return true work?
+            }
+        }
+
+        for i in &to_empty {
+            let next_event = Event { request_id: *i, action: Action::Deliver };
+
+            let new_time = time + self.time_between(path.last().unwrap(), &next_event);
+            let new_cost = cost + self.cost_between(path.last().unwrap(), &next_event);
+
+            let mut new_path = path.clone();
+            new_path.push(next_event);
+
+            let new_to_treat = to_treat.clone();
+
+            let mut new_to_empty = to_empty.clone();
+            new_to_empty.retain(|&x| x != *i);
+
+            let mut new_done = done.clone();
+            new_done.push(*i);
+
+            let result = self.generate_fragments(new_path, new_time, new_cost, new_to_treat, new_to_empty, new_done, num_p);
+
+            if result {
+                found_true = true;
+                // todo add the optimization, how does return true work?
+            }
+        }
+
+        if !found_true {
+            return false;
+        }
+        
+        // Extending to the next pickup node
+        if to_treat.len() + to_empty.len() + done.len() < 2 {
+            let mut total = Vec::new();
+            total.extend(to_treat.clone());
+            total.extend(to_empty.clone());
+            total.extend(done.clone());
+            // Remove duplicates
+            total.sort();
+            total.dedup();
+
+            // If there is a request to empty, assign that
+            let mut to_empty_location = None;
+            if to_empty.len() > 0 {
+                to_empty_location = Some(self.data.requests[to_empty[0]].from_id);
+            }
+
+            for request_id in 0..self.data.requests.len() {
+                if !total.contains(&request_id) {
+                    let request = &self.data.requests[request_id];
+                    if to_empty_location.is_some() && to_empty_location.unwrap() == request.from_id {
+                        continue;
+                    }
+
+                    if path.last().unwrap().action == Action::Pickup && 
+                            path.last().unwrap().request_id > request_id &&
+                            self.data.requests[path.last().unwrap().request_id].from_id == request.from_id {
+                        continue;
+                    }
+
+                    let next_event = Event { request_id, action: Action::Pickup };
+                    let new_time = time + self.time_between(path.last().unwrap(), &next_event);
+                    let new_cost = cost + self.cost_between(path.last().unwrap(), &next_event);
+
+                    let mut new_path = path.clone();
+                    new_path.push(next_event);
+
+                    let mut new_to_treat = to_treat.clone();
+                    new_to_treat.push(request_id);
+
+                    let new_to_empty = to_empty.clone();
+
+                    let mut new_done = done.clone();
+
+                    let result = self.generate_fragments(new_path, new_time, new_cost, new_to_treat, new_to_empty, new_done, num_p + 1);
+                }
+            }
 
         }
 
@@ -111,7 +217,7 @@ struct Event {
     action: Action,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
     Pickup,
     Treat,
