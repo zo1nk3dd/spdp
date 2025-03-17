@@ -1,4 +1,7 @@
-use std::fs;
+use std::vec;
+
+use super::locset::Locset;
+use super::utils::*;
 
 pub struct ModelRestricted {
     pub data : SPDPData,
@@ -13,95 +16,132 @@ impl ModelRestricted {
             fragments: Vec::new(),
         };
 
+        let mut tree: Vec<(State, usize)> = Vec::new();
+        let root = State {
+            event: Event { request_id: 0, action: Action::Pickup },
+            time: 0,
+            cost: 0,
+            treat: Locset::new(),
+            empty: Locset::new(),
+            done: Locset::new(),
+        };
+
+        tree.push((root, 0)); // Placeholder for root node, ends the recursion when generating fragment paths
+
         for request_id in 0..model.data.requests.len() {
-            let path = vec![Event { request_id, action: Action::Pickup }];
+            let event = Event { request_id, action: Action::Pickup };
             let time = model.data.t_pickup + model.data.t_empty + model.data.t_delivery;
             let cost = 0;
-            let to_treat = vec![request_id];
-            let to_empty = Vec::new();
-            let done = Vec::new();
-            let num_p = 1;
+            let mut to_treat = Locset::new();
+            to_treat.insert(request_id);
+            let to_empty = Locset::new();
+            let done = Locset::new();
 
-            model.generate_fragments(path, time, cost, to_treat, to_empty, done, num_p);
+            let state = State {
+                event,
+                time,
+                cost,
+                treat: to_treat,
+                empty: to_empty,
+                done,
+            };
+
+            tree.push((state, 0));
+            let next = tree.len() - 1;
+
+            model.generate_fragments(&mut tree, next);
         }
 
         model
     }
-
+    
     fn generate_fragments(
         &mut self,
-        path: Vec<Event>,
-        time: usize,
-        cost: usize,
-        to_treat: Vec<usize>,
-        to_empty: Vec<usize>,
-        done: Vec<usize>,
-        num_p: usize,
+        tree: &mut Vec<(State, usize)>, // State and parent index
+        curr: usize,
     ) -> bool { 
+        let (state, parent_idx) = tree[curr];
+
+        let last_event = state.event;
+        let time = state.time;
+        let cost = state.cost;
+        let to_treat = state.treat;
+        let to_empty = state.empty;
+        let done = state.done;
+        
         if time > self.data.t_limit {
             return false;
         }
 
         if to_treat.len() + to_empty.len() == 0 {
-            self.fragments.push(Fragment::new(path, time, cost, done));
+            self.fragments.push(Fragment::from_tree(tree, last_event, parent_idx, time, cost, done));
             return true;
         }
 
         let mut found_true = false;
 
-        for i in &to_treat {
-            let next_event = Event { request_id: *i, action: Action::Treat };
-            let new_time = time + self.time_between(path.last().unwrap(), &next_event);
-            let new_cost = cost + self.cost_between(path.last().unwrap(), &next_event);
+        for i in to_treat.iter() {
+            let next_event = Event { request_id: i, action: Action::Treat };
+            let new_time = time + self.time_between(&last_event, &next_event);
+            let new_cost = cost + self.cost_between(&last_event, &next_event);
+            let mut new_to_treat = to_treat;
+            new_to_treat.remove(i);
+            let mut new_to_empty = to_empty;
+            new_to_empty.insert(i);
 
-            let mut new_path = path.clone();
-            new_path.push(next_event);
+            let new_state = State {
+                event: next_event,
+                time: new_time,
+                cost: new_cost,
+                treat: new_to_treat,
+                empty: new_to_empty,
+                done: done,
+            };
 
-            let mut new_to_treat = to_treat.clone();
-            new_to_treat.retain(|&x| x != *i);
+            tree.push((new_state, curr));
+            let next = tree.len() - 1;
 
-            let mut new_to_empty = to_empty.clone();
-            new_to_empty.push(*i);
-
-            let new_done = done.clone();
-
-            let result = self.generate_fragments(new_path, new_time, new_cost, new_to_treat, new_to_empty, new_done, num_p);
+            let result = self.generate_fragments(tree, next);
 
             if result {
                 found_true = true;
                 // todo add the optimization, how does return true work?
-                if path.last().unwrap().action == Action::Treat &&
-                        self.data.requests[path.last().unwrap().request_id].to_id == self.data.requests[*i].to_id {
+                if last_event.action == Action::Treat &&
+                        self.data.requests[last_event.request_id].to_id == self.data.requests[i].to_id {
                     return true;
                 }
             }
         }
 
-        for i in &to_empty {
-            let next_event = Event { request_id: *i, action: Action::Deliver };
+        for i in to_empty.iter() {
+            let next_event = Event { request_id: i, action: Action::Deliver };
+            let new_time = time + self.time_between(&last_event, &next_event);
+            let new_cost = cost + self.cost_between(&last_event, &next_event);
+            let mut new_to_empty = to_empty;
+            new_to_empty.remove(i);
+            let mut new_done = done;
+            new_done.insert(i);
 
-            let new_time = time + self.time_between(path.last().unwrap(), &next_event);
-            let new_cost = cost + self.cost_between(path.last().unwrap(), &next_event);
+            let new_state = State {
+                event: next_event,
+                time: new_time,
+                cost: new_cost,
+                treat: to_treat,
+                empty: new_to_empty,
+                done: new_done,
+            };
+            
+            tree.push((new_state, curr));
+            let next = tree.len() - 1;
 
-            let mut new_path = path.clone();
-            new_path.push(next_event);
-
-            let new_to_treat = to_treat.clone();
-
-            let mut new_to_empty = to_empty.clone();
-            new_to_empty.retain(|&x| x != *i);
-
-            let mut new_done = done.clone();
-            new_done.push(*i);
-
-            let result = self.generate_fragments(new_path, new_time, new_cost, new_to_treat, new_to_empty, new_done, num_p);
+            let result = self.generate_fragments(tree, next);
 
             if result {
                 found_true = true;
                 // todo add the optimization, how does return true work?
                 // ig it just skips extending to pickup in this scenario by returning
-                if path.last().unwrap().action == Action::Deliver &&
-                        self.data.requests[path.last().unwrap().request_id].from_id == self.data.requests[*i].from_id {
+                if last_event.action == Action::Deliver &&
+                        self.data.requests[last_event.request_id].from_id == self.data.requests[i].from_id {
                     return true;
                 }
             }
@@ -113,18 +153,15 @@ impl ModelRestricted {
         
         // Extending to the next pickup node
         if to_treat.len() + to_empty.len() + done.len() < 2 {
-            let mut total = Vec::new();
-            total.extend(to_treat.clone());
-            total.extend(to_empty.clone());
-            total.extend(done.clone());
-            // Remove duplicates
-            total.sort();
-            total.dedup();
+            let mut total = Locset::new();
+            total.union_inplace(&to_treat);
+            total.union_inplace(&to_empty);
+            total.union_inplace(&done);
 
             // If there is a request to empty, assign that
             let mut to_empty_location = None;
             if to_empty.len() > 0 {
-                to_empty_location = Some(self.data.requests[to_empty[0]].from_id);
+                to_empty_location = Some(self.data.requests[to_empty.iter().nth(0).unwrap()].from_id);
             }
 
             for request_id in 0..self.data.requests.len() {
@@ -134,27 +171,33 @@ impl ModelRestricted {
                         continue;
                     }
 
-                    if path.last().unwrap().action == Action::Pickup && 
-                            path.last().unwrap().request_id > request_id &&
-                            self.data.requests[path.last().unwrap().request_id].from_id == request.from_id {
+                    if last_event.action == Action::Pickup && 
+                            last_event.request_id > request_id &&
+                            self.data.requests[last_event.request_id].from_id == request.from_id {
                         continue;
                     }
 
                     let next_event = Event { request_id, action: Action::Pickup };
-                    let new_time = time + self.time_between(path.last().unwrap(), &next_event);
-                    let new_cost = cost + self.cost_between(path.last().unwrap(), &next_event);
+                    let new_time = time + self.time_between(&last_event, &next_event);
+                    let new_cost = cost + self.cost_between(&last_event, &next_event);
+                    let mut new_to_treat = to_treat;
+                    new_to_treat.insert(request_id);
+                    let new_to_empty = to_empty;
+                    let new_done = done;
 
-                    let mut new_path = path.clone();
-                    new_path.push(next_event);
+                    let new_state = State {
+                        event: next_event,
+                        time: new_time,
+                        cost: new_cost,
+                        treat: new_to_treat,
+                        empty: new_to_empty,
+                        done: new_done,
+                    };
 
-                    let mut new_to_treat = to_treat.clone();
-                    new_to_treat.push(request_id);
+                    tree.push((new_state, curr));
+                    let next = tree.len() - 1;
 
-                    let new_to_empty = to_empty.clone();
-
-                    let new_done = done.clone();
-
-                    self.generate_fragments(new_path, new_time, new_cost, new_to_treat, new_to_empty, new_done, num_p + 1);
+                    self.generate_fragments(tree, next);
                 }
             }
 
@@ -196,204 +239,6 @@ impl ModelRestricted {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Fragment {
-    pub events: Vec<Event>,
-    pub time: usize,
-    pub cost: usize,
-    pub done: Vec<usize>,
-}
-
-impl Fragment {
-    fn new(events:Vec<Event>, time: usize, cost: usize, done: Vec<usize>) -> Self {
-        Fragment {
-            events,
-            time,
-            cost,
-            done,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Event {
-    request_id: usize,
-    action: Action,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Action {
-    Pickup,
-    Treat,
-    Deliver,
-    _PP
-}
-
-#[derive(Debug, Clone)]
-pub struct SPDPData {
-    pub container_types: usize,
-    pub waste_types: usize,
-    pub locations: usize,
-    pub fixed_vehicle_cost: usize,
-    pub t_pickup: usize,
-    pub t_empty: usize,
-    pub t_delivery: usize,
-    pub t_limit: usize,
-    pub num_requests: usize,
-    pub requests: Vec<Request>,
-    pub distance: Vec<Vec<usize>>,
-    pub time: Vec<Vec<usize>>, 
-}
-
-impl SPDPData {
-    pub fn from_file(filename: &str) -> Self {
-        let file = fs::read_to_string(filename).unwrap();
-
-        let mut lines = file.lines();
-
-        lines.next();
-        lines.next();
-        lines.next();
-        lines.next();
-        lines.next();
-
-        let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
-        assert_eq!(name, "CONTAINER_TYPES");
-        let container_types: usize = num.trim().parse().unwrap();
-
-        let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
-        assert_eq!(name, "WASTE_TYPES");
-        let waste_types: usize = num.trim().parse().unwrap();
-
-        let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
-        assert_eq!(name, "LOCATIONS");
-        let locations: usize = num.trim().parse().unwrap();
-
-        let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
-        assert_eq!(name, "FixedVehicleCost");
-        let fixed_vehicle_cost: usize = num.trim().parse().unwrap();
-
-        let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
-        assert_eq!(name, "TimePickUp");
-        let t_pickup: usize = num.trim().parse().unwrap();
-
-        let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
-        assert_eq!(name, "TimeEmpty");
-        let t_empty: usize = num.trim().parse().unwrap();
-
-        let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
-        assert_eq!(name, "TimeDelivery");
-        let t_delivery: usize = num.trim().parse().unwrap();
-
-        let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
-        assert_eq!(name, "TimeLimit");
-        let t_limit: usize = num.trim().parse().unwrap();
-
-        let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
-        assert_eq!(name, "REQUESTS");
-        let num_requests: usize = num.trim().parse().unwrap();
-
-        lines.next();
-
-        let mut requests: Vec<Request> = (0..num_requests)
-            .map(|_| {
-                let data = lines.next().unwrap();
-                Request::from_line(data)
-                }
-            ).collect();
-
-        println!("Requests: {:?}", requests.len());
-
-        let mut new_requests = Vec::new();
-
-        for r in &requests {
-            if new_requests.iter().any(|x: &Request| x.from_id == r.from_id && x.to_id == r.to_id) {
-                continue;
-            }
-            let mut count = 0;
-
-            for r2 in &requests {
-                if r.from_id == r2.from_id && r.to_id == r2.to_id {
-                    count += 1;
-                }
-            }
-
-            let mut new_request = r.clone();
-            new_request.quantity = count;
-
-            new_requests.push(new_request);
-        }    
-
-        println!("New Requests: {:?}", new_requests.len());
-        
-        requests = new_requests;
-
-        assert!(lines.next().unwrap().starts_with("Distance"));
-
-        let distance: Vec<Vec<usize>> = (0..locations)
-            .map(|_| {
-                let data = lines.next().unwrap();
-                data.split('\t').into_iter().map(|x| x.parse().unwrap()).collect()
-            }).collect();
-
-        assert!(lines.next().unwrap().starts_with("Time"));
-
-        let time: Vec<Vec<usize>> = (0..locations)
-            .map(|_| {
-                let data = lines.next().unwrap();
-                data.split('\t').into_iter().map(|x| x.parse().unwrap()).collect()
-            }).collect();
-
-        SPDPData {
-            container_types,
-            waste_types,
-            locations,
-            fixed_vehicle_cost,
-            t_pickup,
-            t_empty,
-            t_delivery,
-            t_limit,
-            num_requests,
-            requests,
-            distance,
-            time,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Request {
-    _id: usize,
-    _waste_id: usize,
-    from_id: usize,
-    _container_type: usize,
-    _to_num: usize,
-    to_id: usize,
-    quantity: usize,
-}
-
-impl Request {
-    pub fn from_line(line: &str) -> Self {
-        let mut data = line.split('\t').into_iter();
-
-        let id = data.next().unwrap().parse().unwrap();
-        let waste_id = data.next().unwrap().parse().unwrap();
-        let from_id = data.next().unwrap().parse().unwrap();
-        let container_type = data.next().unwrap().parse().unwrap();
-        let to_num = data.next().unwrap().parse().unwrap();
-        let to_id = data.next().unwrap().parse().unwrap();
-
-        Request {
-            _id: id,
-            _waste_id: waste_id,
-            from_id,
-            _container_type: container_type,
-            _to_num: to_num,
-            to_id,
-            quantity: 1,
-        }
-    }
-}
 
 // Short tests to confirm the data loading is functional
 #[cfg(test)]
@@ -436,4 +281,57 @@ mod tests {
         let model = ModelRestricted::new(spdp);
         assert_eq!(model.fragments.len(), 1920);
     }
+}
+
+
+#[derive(Debug, Clone)]
+pub struct Fragment {
+    pub events: Vec<Event>,
+    pub time: usize,
+    pub cost: usize,
+    pub done: Locset,
+}
+
+impl Fragment {
+    fn from_tree(tree: &mut Vec<(State, usize)>, last_event: Event, parent_idx: usize, time: usize, cost: usize, done: Locset) -> Self {
+        let mut events = vec![last_event];
+        let mut curr = parent_idx;
+        while curr != 0 {
+            let (state, parent) = tree[curr];
+            events.push(state.event);
+            curr = parent;
+        }
+        events.reverse();
+
+        Fragment {
+            events,
+            time,
+            cost,
+            done,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct State {
+    event: Event,
+    time: usize,
+    cost: usize,
+    treat: Locset,
+    empty: Locset,
+    done: Locset,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Event {
+    request_id: usize,
+    action: Action,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Pickup,
+    Treat,
+    Deliver,
+    _PP
 }
