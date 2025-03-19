@@ -37,8 +37,8 @@ impl SPDPData {
         assert_eq!(name, "WASTE_TYPES");
         let waste_types: usize = num.trim().parse().unwrap();
 
-        let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
-        assert_eq!(name, "LOCATIONS");
+        let (_name, num) = lines.next().unwrap().split_once("\t").unwrap();
+        // assert_eq!(name, "LOCATIONS"); // This is a bug in the data file
         let locations: usize = num.trim().parse().unwrap();
 
         let (name, num) = lines.next().unwrap().split_once("\t").unwrap();
@@ -189,4 +189,39 @@ pub enum Action {
     Treat,
     Deliver,
     _PP
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Node {
+    pub location: Option<usize>,
+    pub to_treat: Option<usize>,
+    pub to_empty: Option<usize>,
+}
+
+
+// Short tests to confirm the data loading is functional
+#[cfg(test)]
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_data() {
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A1.dat");
+
+        assert_eq!(spdp.container_types, 9);
+        assert_eq!(spdp.waste_types, 29);
+        assert_eq!(spdp.locations, 23);
+        assert_eq!(spdp.fixed_vehicle_cost, 500);
+        assert_eq!(spdp.t_pickup, 7);
+        assert_eq!(spdp.t_empty, 8);
+        assert_eq!(spdp.t_delivery, 7);
+        assert_eq!(spdp.t_limit, 480);
+        assert_eq!(spdp.num_requests, 5);
+        assert_eq!(spdp.requests.len(), 5);
+        assert_eq!(spdp.distance.len(), 23);
+        assert_eq!(spdp.time.len(), 23);
+        assert_eq!(spdp.requests[0].from_id, 5);
+        assert_eq!(spdp.requests[0].to_id, 14);
+    }
 }

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::utils::*;
 use super::locset::Locset;
 
@@ -16,11 +18,69 @@ impl Generator {
     //     let mut outgoing_fragments_from_request_start: Vec<Vec<usize>> = vec![Vec::new(); self.data.locations];
     // }
 
-    pub fn generate_fragment_arcs(self) -> Vec<Fragment> {
-        let naive_fragments = self.generate_naive_fragments();
-        let arcs = Vec::new();
+    fn generate_nodes(self) -> HashSet<Node> {
+        let depot = Node { 
+            location: None,
+            to_treat: None,
+            to_empty: None,
+        };
 
-        arcs
+        let p_locs: HashSet<usize> = self.data.requests.iter()
+            .map(|x| x.from_id)
+            .collect::<HashSet<usize>>();
+
+        let empty_state_nodes: HashSet<Node> = p_locs.iter()
+            .map(|l| Node {
+                location: Some(*l),
+                to_treat: None,
+                to_empty: None,
+            })
+            .collect();
+
+        let deliver_nodes: HashSet<Node> = p_locs.iter()
+            .map(|l| {
+                p_locs.iter()
+                    .filter_map(|l2| {
+                        if *l != *l2 {
+                            Some(Node {
+                                location: Some(*l),
+                                to_treat: None,
+                                to_empty: Some(*l2),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .flatten()
+            .collect();
+
+        let treat_nodes: HashSet<Node> = p_locs.iter()
+            .map(|l| {
+                self.data.requests.iter()
+                    .filter_map(|r| {
+                        if *l != r.from_id {
+                            Some(Node {
+                                location: Some(*l),
+                                to_treat: Some(r.to_id),
+                                to_empty: Some(r.from_id),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .flatten()
+            .collect(); 
+        
+        let mut nodes = HashSet::new();
+
+        nodes.extend(empty_state_nodes);
+        nodes.extend(deliver_nodes);
+        nodes.extend(treat_nodes);
+        nodes.insert(depot);
+
+        nodes
     }
 
     pub fn generate_naive_fragments(self) -> Vec<Fragment> {
@@ -282,5 +342,44 @@ impl Fragment {
             cost,
             done,
         }
+    }
+}
+
+
+// Short tests to confirm the data loading is functional
+#[cfg(test)]
+
+mod tests {
+    use super::*;
+    
+    #[test]
+
+    fn test_fragment() {
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A1.dat");
+        let fragments = Generator::new(spdp).generate_naive_fragments();
+        assert_eq!(fragments.len(), 145);
+
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_D20.dat");
+        let fragments = Generator::new(spdp).generate_naive_fragments();
+        assert_eq!(fragments.len(), 130444);       
+
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_C6.dat");
+        let fragments = Generator::new(spdp).generate_naive_fragments();
+        assert_eq!(fragments.len(), 1920);
+    }
+
+    #[test]
+    fn test_node_generation() {
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A1.dat");
+        let nodes = Generator::new(spdp).generate_nodes();
+        assert_eq!(nodes.len(), 20);
+
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_B8.dat");
+        let nodes = Generator::new(spdp).generate_nodes();
+        assert_eq!(nodes.len(), 184);
+
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_C1.dat");
+        let nodes = Generator::new(spdp).generate_nodes();
+        assert_eq!(nodes.len(), 67);
     }
 }
