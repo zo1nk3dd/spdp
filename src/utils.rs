@@ -1,4 +1,5 @@
 use std::fs;
+use super::locset::Locset;
 
 #[derive(Debug, Clone)]
 pub struct SPDPData {
@@ -164,4 +165,28 @@ impl Request {
             quantity: 1,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct State {
+    pub event: Event,
+    pub time: usize,
+    pub cost: usize,
+    pub treat: Locset,
+    pub empty: Locset,
+    pub done: Locset,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Event {
+    pub request_id: usize,
+    pub action: Action,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Pickup,
+    Treat,
+    Deliver,
+    _PP
 }
