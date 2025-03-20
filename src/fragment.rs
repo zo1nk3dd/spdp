@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hasher, Hash};
 
 use super::utils::*;
 use super::locset::Locset;
@@ -83,7 +84,14 @@ impl Generator {
         nodes
     }
 
-    pub fn generate_naive_fragments(self) -> Vec<Fragment> {
+    fn generate_restricted_fragments(self) -> Vec<Arc> {
+        let fragments = self.generate_fragments();
+
+
+        Vec::new()
+    }
+
+    pub fn generate_fragments(self) -> Vec<Fragment> {
         let mut tree: Vec<(State, usize)> = Vec::new();
         let root = State {
             event: Event { request_id: 0, action: Action::Pickup },
@@ -345,6 +353,118 @@ impl Fragment {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Arc {
+    pub start: Node,
+    pub end: Node,
+    pub done: DoneSet,
+    pub time: usize,
+    pub cost: usize,
+    pub path: Vec<Event>,
+}
+
+impl Arc {
+    fn dominates(&self, other: &Arc) -> bool {
+        self.cost <= other.cost && self.time <= other.time
+    }
+}
+
+impl Hash for Arc {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.start.hash(state);
+        self.end.hash(state);
+        self.done.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct DoneSet {
+    r1: usize,
+    r2: Option<usize>,
+}
+
+impl DoneSet{
+    fn new(r1: usize, r2: Option<usize>) -> Self {
+        DoneSet {
+            r1,
+            r2,
+        }
+    }
+
+    fn len(&self) -> usize {
+        if self.r2 == None {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn left(&self) -> usize {
+        self.r1
+    }
+
+    fn right(&self) -> usize {
+        if self.r2.is_none() {
+            panic!("No right element in ArcDone")
+        } else {
+            self.r2.unwrap()
+        }
+    }
+}
+
+struct ArcContainer {
+    data: SPDPData,
+    container: HashMap<(Node, Node, DoneSet), Vec<Arc>>,
+}
+
+impl ArcContainer {
+    fn new(data: SPDPData) -> Self {
+        ArcContainer {
+            data,
+            container: HashMap::new(),
+        }
+    }
+
+    
+    fn create_arc(&mut self, start: Node, end: Node, done: DoneSet, path: Vec<Event>) {
+        let (mut time, cost) = (0, 0);
+
+        if done.len() == 2 && done.left() == done.right() {
+            time += self.data.t_pickup + self.data.t_empty + self.data.t_delivery;
+        }
+
+        if start.is_depot() && end.is_depot() {
+            time = self.data.t_limit;
+        }
+
+        let arc = Arc {
+            start,
+            end,
+            done,
+            time,
+            cost,
+            path,
+        };
+
+        let key = (start, end, done);
+        if self.container.contains_key(&key) {
+            if !(self.container.get_mut(&key).unwrap().iter().any(|a| a.dominates(&arc))) {
+                let mut new_arcs: Vec<Arc> = self.container.get(&key).unwrap().iter().filter_map(|a| {
+                    if !arc.dominates(a) {
+                        return Some(a.clone());
+                    }
+                    return None;
+                })
+                .collect();
+                new_arcs.push(arc);
+                self.container.insert(key, new_arcs);
+            }
+        } else {
+            self.container.insert(key, vec![arc]);
+        }
+    }
+}
+
 
 // Short tests to confirm the data loading is functional
 #[cfg(test)]
@@ -356,15 +476,15 @@ mod tests {
 
     fn test_fragment() {
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A1.dat");
-        let fragments = Generator::new(spdp).generate_naive_fragments();
+        let fragments = Generator::new(spdp).generate_fragments();
         assert_eq!(fragments.len(), 145);
 
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_D20.dat");
-        let fragments = Generator::new(spdp).generate_naive_fragments();
+        let fragments = Generator::new(spdp).generate_fragments();
         assert_eq!(fragments.len(), 130444);       
 
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_C6.dat");
-        let fragments = Generator::new(spdp).generate_naive_fragments();
+        let fragments = Generator::new(spdp).generate_fragments();
         assert_eq!(fragments.len(), 1920);
     }
 

@@ -9,7 +9,7 @@ pub struct ModelRestricted {
 impl ModelRestricted {
 
     pub fn new(data: SPDPData) -> Self {
-        let fragments = Generator::new(data.clone()).generate_naive_fragments();
+        let fragments = Generator::new(data.clone()).generate_fragments();
 
         let model = ModelRestricted {
             data,

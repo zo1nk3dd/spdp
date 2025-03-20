@@ -191,11 +191,17 @@ pub enum Action {
     _PP
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Node {
     pub location: Option<usize>,
     pub to_treat: Option<usize>,
     pub to_empty: Option<usize>,
+}
+
+impl Node {
+    pub fn is_depot(&self) -> bool {
+        self.location.is_none()
+    }
 }
 
 
