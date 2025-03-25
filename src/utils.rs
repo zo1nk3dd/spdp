@@ -131,6 +131,51 @@ impl SPDPData {
             time,
         }
     }
+
+    
+    pub fn time_between(&self, a: &Event, b: &Event) -> usize {
+        if b.request_id.is_none() {
+            return 0;
+        }
+        let a_loc = match a.action {
+            Action::Pickup => self.requests[a.request_id.unwrap()].from_id,
+            Action::Treat => self.requests[a.request_id.unwrap()].to_id,
+            Action::Deliver => self.requests[a.request_id.unwrap()].from_id,
+            Action::PP => a.request_id.unwrap(),
+        };
+        let b_loc = match b.action {
+            Action::Pickup => self.requests[b.request_id.unwrap()].from_id,
+            Action::Treat => self.requests[b.request_id.unwrap()].to_id,
+            Action::Deliver => self.requests[b.request_id.unwrap()].from_id,
+            Action::PP => b.request_id.unwrap(),
+        };
+        self.time[a_loc][b_loc]
+    }
+
+    // pub fn generate_routes(&self) -> Vec<Fragment> {
+    //     // Use the fragment struct to store valid routes. Similar to the other code
+    //     // A route is any path through the network with state nodes and fragment arcs
+    //     // Can use DFS to find these
+    // }
+
+    pub fn cost_between(&self, a: &Event, b: &Event) -> usize {
+        if b.request_id.is_none() {
+            return 0;
+        }
+        let a_loc = match a.action {
+            Action::Pickup => self.requests[a.request_id.unwrap()].from_id,
+            Action::Treat => self.requests[a.request_id.unwrap()].to_id,
+            Action::Deliver => self.requests[a.request_id.unwrap()].from_id,
+            Action::PP => a.request_id.unwrap(),
+        };
+        let b_loc = match b.action {
+            Action::Pickup => self.requests[b.request_id.unwrap()].from_id,
+            Action::Treat => self.requests[b.request_id.unwrap()].to_id,
+            Action::Deliver => self.requests[b.request_id.unwrap()].from_id,
+            Action::PP => b.request_id.unwrap(),
+        };
+        self.distance[a_loc][b_loc]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -179,7 +224,7 @@ pub struct State {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Event {
-    pub request_id: usize,
+    pub request_id: Option<usize>,
     pub action: Action,
 }
 
@@ -188,7 +233,7 @@ pub enum Action {
     Pickup,
     Treat,
     Deliver,
-    _PP
+    PP
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

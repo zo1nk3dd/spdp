@@ -19,7 +19,7 @@ impl Generator {
     //     let mut outgoing_fragments_from_request_start: Vec<Vec<usize>> = vec![Vec::new(); self.data.locations];
     // }
 
-    fn generate_nodes(self) -> HashSet<Node> {
+    fn generate_nodes(&self) -> NodeContainer {
         let depot = Node { 
             location: None,
             to_treat: None,
@@ -30,13 +30,15 @@ impl Generator {
             .map(|x| x.from_id)
             .collect::<HashSet<usize>>();
 
-        let empty_state_nodes: HashSet<Node> = p_locs.iter()
+        let mut empty_state_nodes: HashSet<Node> = p_locs.iter()
             .map(|l| Node {
                 location: Some(*l),
                 to_treat: None,
                 to_empty: None,
             })
             .collect();
+
+        empty_state_nodes.insert(depot.clone());
 
         let deliver_nodes: HashSet<Node> = p_locs.iter()
             .map(|l| {
@@ -76,25 +78,214 @@ impl Generator {
         
         let mut nodes = HashSet::new();
 
-        nodes.extend(empty_state_nodes);
-        nodes.extend(deliver_nodes);
-        nodes.extend(treat_nodes);
-        nodes.insert(depot);
+        for node in empty_state_nodes.iter() {
+            nodes.insert(node.clone());
+        }
+        for node in deliver_nodes.iter() {
+            nodes.insert(node.clone());
+        }
+        for node in treat_nodes.iter() {
+            nodes.insert(node.clone());
+        }
 
-        nodes
+        NodeContainer { 
+            nodes, 
+            pickup_nodes: empty_state_nodes,
+            treat_nodes,
+            deliver_nodes,
+            depot,
+        }
     }
 
-    fn generate_restricted_fragments(self) -> Vec<Arc> {
+    pub fn generate_restricted_fragments(&self) -> ArcContainer {
         let fragments = self.generate_fragments();
+        let nodes = self.generate_nodes();
+
+        let mut arc_container = ArcContainer::new(self.data.clone());
+
+        for f in fragments {
+            let mut done = f.done.iter();
+            let done_set = DoneSet::new(done.next().unwrap(), done.next());
+
+            for pickup in nodes.pickup_nodes.iter() {
+                let mut extended = f.events.clone();
+                extended.push(Event { request_id: pickup.location, action: Action::PP });
+                
+                arc_container.create_arc(
+                    Node { 
+                        location: Some(self.data.requests[f.events[0].request_id.unwrap()].from_id),
+                        to_treat: None, 
+                        to_empty: None
+                    },
+                    pickup.clone(),
+                    done_set,
+                    extended,      
+                );   
+            }
+
+            if done_set.len() == 1 {
+                if self.data.requests[done_set.left()].quantity >= 2 {
+                    let done_set_dup = DoneSet {
+                        r1: done_set.left(),
+                        r2: Some(done_set.left()),
+                    };
+
+                    for pickup in nodes.pickup_nodes.iter() {
+                        let mut extended = f.events.clone();
+                        extended.push(Event { request_id: pickup.location, action: Action::PP });
+                        
+                        arc_container.create_arc(
+                            Node { 
+                                location: Some(self.data.requests[f.events[0].request_id.unwrap()].from_id),
+                                to_treat: None, 
+                                to_empty: None
+                            },
+                            *pickup,
+                            done_set_dup,
+                            extended,      
+                        );   
+                    } 
+                }
+                continue;
+            }
 
 
-        Vec::new()
+            let second_pickup_index = f.events.iter().skip(1) // The first pickup
+                .position(|e| e.action == Action::Pickup)
+                .unwrap() + 1;
+
+            assert!(second_pickup_index <= 2);
+
+            
+            let late_start_node = Node {
+                location: Some(self.data.requests[f.events[second_pickup_index].request_id.unwrap()].from_id),
+                to_treat: if second_pickup_index == 1 { Some(self.data.requests[f.events[0].request_id.unwrap()].to_id)} else { None},
+                to_empty: Some(self.data.requests[f.events[0].request_id.unwrap()].from_id),
+            };
+
+            let done_set_no_first_pickup = DoneSet::new(f.events[second_pickup_index].request_id.unwrap(), None);
+
+            // assert!(nodes.nodes.contains(&late_start_node));
+
+            for p in nodes.pickup_nodes.iter() {
+                let mut extended: Vec<Event> = f.events.clone()[second_pickup_index..].to_vec();
+                extended.push(Event { request_id: p.location, action: Action::PP });
+
+                if late_start_node.location != late_start_node.to_empty {
+                    arc_container.create_arc(
+                        late_start_node,
+                        *p,
+                        done_set_no_first_pickup,
+                        extended,
+                    );
+                }
+            }
+
+            let first_delivery_index = f.events.iter() 
+                .position(|e| e.action == Action::Deliver)
+                .unwrap();
+
+            let onboard_transfer_location = if f.events[first_delivery_index + 1].action == Action::Treat {
+                    Some(self.data.requests[f.events[first_delivery_index + 1].request_id.unwrap()].to_id)
+                } else {
+                    None
+                };
+
+            let onboard_deliver_location = Some(self.data.requests[f.events[first_delivery_index + 1].request_id.unwrap()].from_id);
+
+            if onboard_transfer_location.is_some() {
+                for pickup in nodes.pickup_nodes.iter() {
+                    if pickup.is_depot() {
+                        continue;
+                    }
+                    if onboard_deliver_location != pickup.location {
+                        let mut extended = f.events.clone()[..(first_delivery_index+1)].to_vec();
+                        extended.push(Event { request_id: pickup.location, action: Action::PP });
+
+                        let early_finish_node = Node {
+                            location: pickup.location,
+                            to_treat: onboard_transfer_location,
+                            to_empty: onboard_deliver_location,
+                        };
+
+                        arc_container.create_arc(
+                            Node {
+                                location: Some(self.data.requests[f.events[0].request_id.unwrap()].from_id),
+                                to_treat: None,
+                                to_empty: None,
+                            },
+                            early_finish_node,
+                            done_set,
+                            extended,
+                        );
+
+                        // Potential issue, no if fnode in nodes but i dont see any node pruning
+
+                        let mut extended = f.events.clone()[(second_pickup_index)..(first_delivery_index+1)].to_vec();
+                        extended.push(Event { request_id: pickup.location, action: Action::PP });
+
+                        if late_start_node.location != late_start_node.to_empty {
+                            arc_container.create_arc(
+                                late_start_node,
+                                early_finish_node, 
+                                done_set_no_first_pickup, 
+                                extended);
+                        }
+                    }
+                }
+            }
+
+            let only_deliver_left = first_delivery_index + 
+                (if onboard_transfer_location.is_some() { 1 } else { 0 });
+
+            for pickup in nodes.pickup_nodes.iter() {
+                if pickup.is_depot() {
+                    continue;
+                }
+                if onboard_deliver_location != pickup.location {
+                    let mut extended = f.events.clone()[..(only_deliver_left+1)].to_vec();
+                    extended.push(Event { request_id: pickup.location, action: Action::PP });
+
+                    arc_container.create_arc(
+                        Node {
+                            location: Some(self.data.requests[f.events[0].request_id.unwrap()].from_id),
+                            to_treat: None,
+                            to_empty: None,
+                        },
+                        Node {
+                            location: pickup.location,
+                            to_treat: None,
+                            to_empty: onboard_deliver_location,
+                        },
+                        done_set,
+                        extended,
+                    );
+
+                    let mut extended = f.events.clone()[(second_pickup_index)..(only_deliver_left+1)].to_vec();
+                    extended.push(Event { request_id: pickup.location, action: Action::PP });
+
+                    if late_start_node.location != late_start_node.to_empty {
+                        arc_container.create_arc(
+                            late_start_node,
+                            Node {
+                                location: pickup.location,
+                                to_treat: None,
+                                to_empty: onboard_deliver_location,
+                            },
+                            done_set_no_first_pickup,
+                            extended,
+                        );
+                    }
+                }
+            }
+        }
+        arc_container
     }
 
-    pub fn generate_fragments(self) -> Vec<Fragment> {
+    pub fn generate_fragments(&self) -> Vec<Fragment> {
         let mut tree: Vec<(State, usize)> = Vec::new();
         let root = State {
-            event: Event { request_id: 0, action: Action::Pickup },
+            event: Event { request_id: Some(0), action: Action::Pickup },
             time: 0,
             cost: 0,
             treat: Locset::new(),
@@ -107,7 +298,7 @@ impl Generator {
         let mut fragments: Vec<Fragment> = Vec::new();
 
         for request_id in 0..self.data.requests.len() {
-            let event = Event { request_id, action: Action::Pickup };
+            let event = Event { request_id: Some(request_id), action: Action::Pickup };
             let time = self.data.t_pickup + self.data.t_empty + self.data.t_delivery;
             let cost = 0;
             let mut to_treat = Locset::new();
@@ -161,9 +352,9 @@ impl Generator {
         let mut found_true = false;
 
         for i in to_treat.iter() {
-            let next_event = Event { request_id: i, action: Action::Treat };
-            let new_time = time + self.time_between(&last_event, &next_event);
-            let new_cost = cost + self.cost_between(&last_event, &next_event);
+            let next_event = Event { request_id: Some(i), action: Action::Treat };
+            let new_time = time + self.data.time_between(&last_event, &next_event);
+            let new_cost = cost + self.data.cost_between(&last_event, &next_event);
             let mut new_to_treat = to_treat;
             new_to_treat.remove(i);
             let mut new_to_empty = to_empty;
@@ -187,16 +378,16 @@ impl Generator {
                 found_true = true;
                 // todo add the optimization, how does return true work?
                 if last_event.action == Action::Treat &&
-                        self.data.requests[last_event.request_id].to_id == self.data.requests[i].to_id {
+                        self.data.requests[last_event.request_id.unwrap()].to_id == self.data.requests[i].to_id {
                     return true;
                 }
             }
         }
 
         for i in to_empty.iter() {
-            let next_event = Event { request_id: i, action: Action::Deliver };
-            let new_time = time + self.time_between(&last_event, &next_event);
-            let new_cost = cost + self.cost_between(&last_event, &next_event);
+            let next_event = Event { request_id: Some(i), action: Action::Deliver };
+            let new_time = time + self.data.time_between(&last_event, &next_event);
+            let new_cost = cost + self.data.cost_between(&last_event, &next_event);
             let mut new_to_empty = to_empty;
             new_to_empty.remove(i);
             let mut new_done = done;
@@ -221,7 +412,7 @@ impl Generator {
                 // todo add the optimization, how does return true work?
                 // ig it just skips extending to pickup in this scenario by returning
                 if last_event.action == Action::Deliver &&
-                        self.data.requests[last_event.request_id].from_id == self.data.requests[i].from_id {
+                        self.data.requests[last_event.request_id.unwrap()].from_id == self.data.requests[i].from_id {
                     return true;
                 }
             }
@@ -252,14 +443,14 @@ impl Generator {
                     }
 
                     if last_event.action == Action::Pickup && 
-                            last_event.request_id > request_id &&
-                            self.data.requests[last_event.request_id].from_id == request.from_id {
+                            last_event.request_id.unwrap() > request_id &&
+                            self.data.requests[last_event.request_id.unwrap()].from_id == request.from_id {
                         continue;
                     }
 
-                    let next_event = Event { request_id, action: Action::Pickup };
-                    let new_time = time + self.time_between(&last_event, &next_event);
-                    let new_cost = cost + self.cost_between(&last_event, &next_event);
+                    let next_event = Event { request_id: Some(request_id), action: Action::Pickup };
+                    let new_time = time + self.data.time_between(&last_event, &next_event);
+                    let new_cost = cost + self.data.cost_between(&last_event, &next_event);
                     let mut new_to_treat = to_treat;
                     new_to_treat.insert(request_id);
                     let new_to_empty = to_empty;
@@ -282,44 +473,6 @@ impl Generator {
             }
         }
         return true;
-    }
-
-    fn time_between(&self, a: &Event, b: &Event) -> usize {
-        let a_loc = match a.action {
-            Action::Pickup => self.data.requests[a.request_id].from_id,
-            Action::Treat => self.data.requests[a.request_id].to_id,
-            Action::Deliver => self.data.requests[a.request_id].from_id,
-            Action::_PP => self.data.requests[a.request_id].from_id,
-        };
-        let b_loc = match b.action {
-            Action::Pickup => self.data.requests[b.request_id].from_id,
-            Action::Treat => self.data.requests[b.request_id].to_id,
-            Action::Deliver => self.data.requests[b.request_id].from_id,
-            Action::_PP => self.data.requests[b.request_id].from_id,
-        };
-        self.data.time[a_loc][b_loc]
-    }
-
-    // pub fn generate_routes(&self) -> Vec<Fragment> {
-    //     // Use the fragment struct to store valid routes. Similar to the other code
-    //     // A route is any path through the network with state nodes and fragment arcs
-    //     // Can use DFS to find these
-    // }
-
-    fn cost_between(&self, a: &Event, b: &Event) -> usize {
-        let a_loc = match a.action {
-            Action::Pickup => self.data.requests[a.request_id].from_id,
-            Action::Treat => self.data.requests[a.request_id].to_id,
-            Action::Deliver => self.data.requests[a.request_id].from_id,
-            Action::_PP => self.data.requests[a.request_id].from_id,
-        };
-        let b_loc = match b.action {
-            Action::Pickup => self.data.requests[b.request_id].from_id,
-            Action::Treat => self.data.requests[b.request_id].to_id,
-            Action::Deliver => self.data.requests[b.request_id].from_id,
-            Action::_PP => self.data.requests[b.request_id].from_id,
-        };
-        self.data.distance[a_loc][b_loc]
     }
 }
 
@@ -365,7 +518,11 @@ pub struct Arc {
 
 impl Arc {
     fn dominates(&self, other: &Arc) -> bool {
-        self.cost <= other.cost && self.time <= other.time
+        if (self.cost <= other.cost && self.time <= other.time) == true {
+            // println!("{:?} dominates {:?}", self, other);
+            return true;
+        }
+        false
     }
 }
 
@@ -391,7 +548,7 @@ impl DoneSet{
         }
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         if self.r2 == None {
             1
         } else {
@@ -399,11 +556,11 @@ impl DoneSet{
         }
     }
 
-    fn left(&self) -> usize {
+    pub fn left(&self) -> usize {
         self.r1
     }
 
-    fn right(&self) -> usize {
+    pub fn right(&self) -> usize {
         if self.r2.is_none() {
             panic!("No right element in ArcDone")
         } else {
@@ -412,9 +569,17 @@ impl DoneSet{
     }
 }
 
-struct ArcContainer {
-    data: SPDPData,
-    container: HashMap<(Node, Node, DoneSet), Vec<Arc>>,
+struct NodeContainer {
+    nodes: HashSet<Node>,
+    pickup_nodes: HashSet<Node>,
+    treat_nodes: HashSet<Node>,
+    deliver_nodes: HashSet<Node>,
+    depot: Node,
+}
+
+pub struct ArcContainer {
+    pub data: SPDPData,
+    pub container: HashMap<(Node, Node, DoneSet), Vec<Arc>>,
 }
 
 impl ArcContainer {
@@ -425,9 +590,24 @@ impl ArcContainer {
         }
     }
 
+    pub fn num_keys(&self) -> usize {
+        self.container.len()
+    }
+
+    pub fn num_arcs(&self) -> usize {
+        self.container.iter().map(|(_, v)| v.len()).sum()
+    }
     
     fn create_arc(&mut self, start: Node, end: Node, done: DoneSet, path: Vec<Event>) {
-        let (mut time, cost) = (0, 0);
+        let mut time = path.iter()
+            .zip(path.iter().skip(1))
+            .map(|(a, b)| self.data.time_between(a, b))
+            .sum();
+
+        let mut cost = path.iter()
+            .zip(path.iter().skip(1))
+            .map(|(a, b)| self.data.cost_between(a, b))
+            .sum();
 
         if done.len() == 2 && done.left() == done.right() {
             time += self.data.t_pickup + self.data.t_empty + self.data.t_delivery;
@@ -492,14 +672,36 @@ mod tests {
     fn test_node_generation() {
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A1.dat");
         let nodes = Generator::new(spdp).generate_nodes();
-        assert_eq!(nodes.len(), 20);
+        assert_eq!(nodes.nodes.len(), 20);
 
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_B8.dat");
         let nodes = Generator::new(spdp).generate_nodes();
-        assert_eq!(nodes.len(), 184);
+        assert_eq!(nodes.nodes.len(), 184);
 
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_C1.dat");
         let nodes = Generator::new(spdp).generate_nodes();
-        assert_eq!(nodes.len(), 67);
+        assert_eq!(nodes.nodes.len(), 67);
+    }
+
+    #[test]
+    fn test_arc_generation() {
+        let spdp = SPDPData::from_file("./SkipData/Testing/small.dat");
+        let arccontainer = Generator::new(spdp).generate_restricted_fragments();
+        assert_eq!(arccontainer.num_keys(), 46);
+
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A1.dat");
+        let arccontainer = Generator::new(spdp).generate_restricted_fragments();
+        assert_eq!(arccontainer.num_keys(), 474);
+        assert_eq!(arccontainer.num_arcs(), 576);
+
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_B8.dat");
+        let arccontainer = Generator::new(spdp).generate_restricted_fragments();
+        assert_eq!(arccontainer.num_keys(), 20944);
+        assert_eq!(arccontainer.num_arcs(), 22601);
+
+        let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_C10.dat");
+        let arccontainer = Generator::new(spdp).generate_restricted_fragments();
+        assert_eq!(arccontainer.num_keys(), 53486);
+        assert_eq!(arccontainer.num_arcs(), 59009);
     }
 }
