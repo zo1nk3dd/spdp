@@ -19,7 +19,7 @@ impl Generator {
     //     let mut outgoing_fragments_from_request_start: Vec<Vec<usize>> = vec![Vec::new(); self.data.locations];
     // }
 
-    fn generate_nodes(&self) -> NodeContainer {
+    pub fn generate_nodes(&self) -> NodeContainer {
         let depot = Node { 
             location: None,
             to_treat: None,
@@ -97,7 +97,7 @@ impl Generator {
         }
     }
 
-    pub fn generate_restricted_fragments(&self) -> ArcContainer {
+    pub fn generate_arcs(&self) -> ArcContainer {
         let fragments = self.generate_fragments();
         let nodes = self.generate_nodes();
 
@@ -105,7 +105,7 @@ impl Generator {
 
         for f in fragments {
             let mut done = f.done.iter();
-            let done_set = DoneSet::new(done.next().unwrap(), done.next());
+            let done_set = DoneSet::new(Some(done.next().unwrap()), done.next());
 
             for pickup in nodes.pickup_nodes.iter() {
                 let mut extended = f.events.clone();
@@ -126,7 +126,7 @@ impl Generator {
             if done_set.len() == 1 {
                 if self.data.requests[done_set.left()].quantity >= 2 {
                     let done_set_dup = DoneSet {
-                        r1: done_set.left(),
+                        r1: Some(done_set.left()),
                         r2: Some(done_set.left()),
                     };
 
@@ -163,7 +163,7 @@ impl Generator {
                 to_empty: Some(self.data.requests[f.events[0].request_id.unwrap()].from_id),
             };
 
-            let done_set_no_first_pickup = DoneSet::new(f.events[second_pickup_index].request_id.unwrap(), None);
+            let done_set_no_first_pickup = DoneSet::new(Some(f.events[second_pickup_index].request_id.unwrap()), None);
 
             // assert!(nodes.nodes.contains(&late_start_node));
 
@@ -279,6 +279,18 @@ impl Generator {
                 }
             }
         }
+
+        for node in nodes.pickup_nodes {
+            if !node.is_depot() {
+                arc_container.create_arc(
+                    nodes.depot, 
+                    node, 
+                    DoneSet::new(None, None),
+                    vec!(),
+                );
+            }
+        }
+        
         arc_container
     }
 
@@ -536,12 +548,12 @@ impl Hash for Arc {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct DoneSet {
-    r1: usize,
+    r1: Option<usize>,
     r2: Option<usize>,
 }
 
 impl DoneSet{
-    fn new(r1: usize, r2: Option<usize>) -> Self {
+    fn new(r1: Option<usize>, r2: Option<usize>) -> Self {
         DoneSet {
             r1,
             r2,
@@ -550,14 +562,22 @@ impl DoneSet{
 
     pub fn len(&self) -> usize {
         if self.r2 == None {
-            1
+            if self.r1 == None {
+                0
+            } else {
+                1
+            }
         } else {
             2
         }
     }
 
     pub fn left(&self) -> usize {
-        self.r1
+        if self.r1.is_none() {
+            panic!("No left element in ArcDone")
+        } else {
+            self.r1.unwrap()
+        }
     }
 
     pub fn right(&self) -> usize {
@@ -569,17 +589,19 @@ impl DoneSet{
     }
 }
 
-struct NodeContainer {
-    nodes: HashSet<Node>,
-    pickup_nodes: HashSet<Node>,
-    treat_nodes: HashSet<Node>,
-    deliver_nodes: HashSet<Node>,
-    depot: Node,
+pub struct NodeContainer {
+    pub nodes: HashSet<Node>,
+    pub pickup_nodes: HashSet<Node>,
+    pub treat_nodes: HashSet<Node>,
+    pub deliver_nodes: HashSet<Node>,
+    pub depot: Node,
 }
 
 pub struct ArcContainer {
     pub data: SPDPData,
     pub container: HashMap<(Node, Node, DoneSet), Vec<Arc>>,
+    pub arcs_from: HashMap<Node, Vec<Arc>>,
+    pub arcs_to: HashMap<Node, Vec<Arc>>,
 }
 
 impl ArcContainer {
@@ -587,6 +609,8 @@ impl ArcContainer {
         ArcContainer {
             data,
             container: HashMap::new(),
+            arcs_from: HashMap::new(),
+            arcs_to: HashMap::new(),
         }
     }
 
@@ -604,7 +628,7 @@ impl ArcContainer {
             .map(|(a, b)| self.data.time_between(a, b))
             .sum();
 
-        let mut cost = path.iter()
+        let cost = path.iter()
             .zip(path.iter().skip(1))
             .map(|(a, b)| self.data.cost_between(a, b))
             .sum();
@@ -636,11 +660,25 @@ impl ArcContainer {
                     return None;
                 })
                 .collect();
-                new_arcs.push(arc);
+                new_arcs.push(arc.clone());
                 self.container.insert(key, new_arcs);
+
+                self.arcs_from.get_mut(&start).unwrap().push(arc.clone());
+                self.arcs_to.get_mut(&end).unwrap().push(arc.clone());
             }
         } else {
-            self.container.insert(key, vec![arc]);
+            self.container.insert(key, vec![arc.clone()]);
+
+            if !self.arcs_from.contains_key(&start) {
+                self.arcs_from.insert(start, Vec::new());
+            }
+            self.arcs_from.get_mut(&start).unwrap().push(arc.clone());
+
+            if !self.arcs_to.contains_key(&end) {
+                self.arcs_to.insert(end, Vec::new());
+            }
+            self.arcs_to.get_mut(&end).unwrap().push(arc.clone());
+
         }
     }
 }
@@ -686,22 +724,19 @@ mod tests {
     #[test]
     fn test_arc_generation() {
         let spdp = SPDPData::from_file("./SkipData/Testing/small.dat");
-        let arccontainer = Generator::new(spdp).generate_restricted_fragments();
-        assert_eq!(arccontainer.num_keys(), 46);
+        let arccontainer = Generator::new(spdp).generate_arcs();
+        assert_eq!(arccontainer.num_keys(), 48);
 
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A1.dat");
-        let arccontainer = Generator::new(spdp).generate_restricted_fragments();
-        assert_eq!(arccontainer.num_keys(), 474);
-        assert_eq!(arccontainer.num_arcs(), 576);
+        let arccontainer = Generator::new(spdp).generate_arcs();
+        assert_eq!(arccontainer.num_arcs(), 579);
 
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_B8.dat");
-        let arccontainer = Generator::new(spdp).generate_restricted_fragments();
-        assert_eq!(arccontainer.num_keys(), 20944);
-        assert_eq!(arccontainer.num_arcs(), 22601);
+        let arccontainer = Generator::new(spdp).generate_arcs();
+        assert_eq!(arccontainer.num_arcs(), 22609);
 
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_C10.dat");
-        let arccontainer = Generator::new(spdp).generate_restricted_fragments();
-        assert_eq!(arccontainer.num_keys(), 53486);
-        assert_eq!(arccontainer.num_arcs(), 59009);
+        let arccontainer = Generator::new(spdp).generate_arcs();
+        assert_eq!(arccontainer.num_arcs(), 59019);
     }
 }
