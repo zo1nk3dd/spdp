@@ -125,7 +125,7 @@ impl SPDPData {
             t_empty,
             t_delivery,
             t_limit,
-            num_requests,
+            num_requests: requests.len(),
             requests,
             distance,
             time,

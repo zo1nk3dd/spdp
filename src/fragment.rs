@@ -628,10 +628,14 @@ impl ArcContainer {
             .map(|(a, b)| self.data.time_between(a, b))
             .sum();
 
-        let cost = path.iter()
+        let mut cost = path.iter()
             .zip(path.iter().skip(1))
             .map(|(a, b)| self.data.cost_between(a, b))
             .sum();
+
+        if start.is_depot() {
+            cost += self.data.fixed_vehicle_cost;
+        }
 
         if done.len() == 2 && done.left() == done.right() {
             time += self.data.t_pickup + self.data.t_empty + self.data.t_delivery;

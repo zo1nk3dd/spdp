@@ -3,7 +3,7 @@ use spdp::utils::*;
 use std::time::Instant;
 
 fn main() {
-    let data = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_C10.dat");
+    let data = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A2.dat");
 
     let time = Instant::now();
     
