@@ -30,7 +30,7 @@ impl Generator {
             .map(|x| x.from_id)
             .collect::<HashSet<usize>>();
 
-        let mut empty_state_nodes: HashSet<Node> = p_locs.iter()
+        let mut empty_state_nodes: Vec<Node> = p_locs.iter()
             .map(|l| Node {
                 location: Some(*l),
                 to_treat: None,
@@ -38,9 +38,9 @@ impl Generator {
             })
             .collect();
 
-        empty_state_nodes.insert(depot.clone());
+        empty_state_nodes.push(depot.clone());
 
-        let deliver_nodes: HashSet<Node> = p_locs.iter()
+        let deliver_nodes: Vec<Node> = p_locs.iter()
             .map(|l| {
                 p_locs.iter()
                     .filter_map(|l2| {
@@ -58,7 +58,7 @@ impl Generator {
             .flatten()
             .collect();
 
-        let treat_nodes: HashSet<Node> = p_locs.iter()
+        let treat_nodes: Vec<Node> = p_locs.iter()
             .map(|l| {
                 self.data.requests.iter()
                     .filter_map(|r| {
@@ -74,18 +74,17 @@ impl Generator {
                     })
             })
             .flatten()
-            .collect(); 
-        
-        let mut nodes = HashSet::new();
+            .collect();   
+        let mut nodes = Vec::new();
 
         for node in empty_state_nodes.iter() {
-            nodes.insert(node.clone());
+            nodes.push(node.clone());
         }
         for node in deliver_nodes.iter() {
-            nodes.insert(node.clone());
+            nodes.push(node.clone());
         }
         for node in treat_nodes.iter() {
-            nodes.insert(node.clone());
+            nodes.push(node.clone());
         }
 
         NodeContainer { 
@@ -290,6 +289,8 @@ impl Generator {
                 );
             }
         }
+
+        arc_container.process_once_populated();
         
         arc_container
     }
@@ -520,6 +521,7 @@ impl Fragment {
 
 #[derive(Debug, Clone)]
 pub struct Arc {
+    pub id: usize,
     pub start: Node,
     pub end: Node,
     pub done: DoneSet,
@@ -590,16 +592,17 @@ impl DoneSet{
 }
 
 pub struct NodeContainer {
-    pub nodes: HashSet<Node>,
-    pub pickup_nodes: HashSet<Node>,
-    pub treat_nodes: HashSet<Node>,
-    pub deliver_nodes: HashSet<Node>,
+    pub nodes: Vec<Node>,
+    pub pickup_nodes: Vec<Node>,
+    pub treat_nodes: Vec<Node>,
+    pub deliver_nodes: Vec<Node>,
     pub depot: Node,
 }
 
 pub struct ArcContainer {
     pub data: SPDPData,
     pub container: HashMap<(Node, Node, DoneSet), Vec<Arc>>,
+    pub arcs: Vec<Arc>,
     pub arcs_from: HashMap<Node, Vec<Arc>>,
     pub arcs_to: HashMap<Node, Vec<Arc>>,
 }
@@ -609,6 +612,7 @@ impl ArcContainer {
         ArcContainer {
             data,
             container: HashMap::new(),
+            arcs: Vec::new(),
             arcs_from: HashMap::new(),
             arcs_to: HashMap::new(),
         }
@@ -619,7 +623,7 @@ impl ArcContainer {
     }
 
     pub fn num_arcs(&self) -> usize {
-        self.container.iter().map(|(_, v)| v.len()).sum()
+        self.arcs.len()
     }
     
     fn create_arc(&mut self, start: Node, end: Node, done: DoneSet, path: Vec<Event>) {
@@ -646,6 +650,7 @@ impl ArcContainer {
         }
 
         let arc = Arc {
+            id: 0,
             start,
             end,
             done,
@@ -666,23 +671,30 @@ impl ArcContainer {
                 .collect();
                 new_arcs.push(arc.clone());
                 self.container.insert(key, new_arcs);
-
-                self.arcs_from.get_mut(&start).unwrap().push(arc.clone());
-                self.arcs_to.get_mut(&end).unwrap().push(arc.clone());
             }
         } else {
             self.container.insert(key, vec![arc.clone()]);
 
-            if !self.arcs_from.contains_key(&start) {
-                self.arcs_from.insert(start, Vec::new());
-            }
-            self.arcs_from.get_mut(&start).unwrap().push(arc.clone());
+        }
+    }
 
-            if !self.arcs_to.contains_key(&end) {
-                self.arcs_to.insert(end, Vec::new());
-            }
-            self.arcs_to.get_mut(&end).unwrap().push(arc.clone());
+    fn process_once_populated(&mut self) {
+        for (id, arc) in self.container.values().flatten().enumerate() {
+            let mut new_arc = arc.clone();
+            new_arc.id = id;
+            self.arcs.push(new_arc.clone());
 
+            if self.arcs_from.contains_key(&arc.start) {
+                self.arcs_from.get_mut(&arc.start).unwrap().push(new_arc.clone());
+            } else {
+                self.arcs_from.insert(arc.start, vec![new_arc.clone()]);
+            }
+
+            if self.arcs_to.contains_key(&arc.end) {
+                self.arcs_to.get_mut(&arc.end).unwrap().push(new_arc.clone());
+            } else {
+                self.arcs_to.insert(arc.end, vec![new_arc.clone()]);
+            }
         }
     }
 }
