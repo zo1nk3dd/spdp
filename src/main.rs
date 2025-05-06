@@ -3,11 +3,11 @@ use spdp::utils::*;
 use std::time::Instant;
 
 fn main() {
-    let data = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A1.dat");
+    let data = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_B1.dat");
 
     let time = Instant::now();
     
-    let mut model = MasterProblemModel::new(data);
+    let mut model = ColGenModel::new(data);
     
     model.solve();
 

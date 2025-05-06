@@ -21,6 +21,7 @@ impl Generator {
 
     pub fn generate_nodes(&self) -> NodeContainer {
         let depot = Node { 
+            id: 0,
             location: None,
             to_treat: None,
             to_empty: None,
@@ -30,8 +31,10 @@ impl Generator {
             .map(|x| x.from_id)
             .collect::<HashSet<usize>>();
 
-        let mut empty_state_nodes: Vec<Node> = p_locs.iter()
-            .map(|l| Node {
+        let mut offset = 1;
+        let mut empty_state_nodes: Vec<Node> = p_locs.iter().enumerate()
+            .map(|(idx, l)| Node {
+                id: idx + offset,
                 location: Some(*l),
                 to_treat: None,
                 to_empty: None,
@@ -39,13 +42,16 @@ impl Generator {
             .collect();
 
         empty_state_nodes.push(depot.clone());
+        
+        offset = empty_state_nodes.len();
 
-        let deliver_nodes: Vec<Node> = p_locs.iter()
+        let mut deliver_nodes: Vec<Node> = p_locs.iter()
             .map(|l| {
                 p_locs.iter()
                     .filter_map(|l2| {
                         if *l != *l2 {
                             Some(Node {
+                                id: 0,
                                 location: Some(*l),
                                 to_treat: None,
                                 to_empty: Some(*l2),
@@ -58,12 +64,25 @@ impl Generator {
             .flatten()
             .collect();
 
-        let treat_nodes: Vec<Node> = p_locs.iter()
+        deliver_nodes = deliver_nodes.iter()
+            .enumerate()
+            .map(|(idx, l)| Node {
+                id: idx + offset,
+                location: l.location,
+                to_treat: l.to_treat,
+                to_empty: l.to_empty,
+            })
+            .collect();
+
+        offset = deliver_nodes.len() + empty_state_nodes.len();
+
+        let mut treat_nodes: Vec<Node> = p_locs.iter()
             .map(|l| {
                 self.data.requests.iter()
                     .filter_map(|r| {
                         if *l != r.from_id {
                             Some(Node {
+                                id: 0, 
                                 location: Some(*l),
                                 to_treat: Some(r.to_id),
                                 to_empty: Some(r.from_id),
@@ -75,6 +94,17 @@ impl Generator {
             })
             .flatten()
             .collect();   
+
+        treat_nodes = treat_nodes.iter()
+            .enumerate()
+            .map(|(idx, l)| Node {
+                id: idx + offset,
+                location: l.location,
+                to_treat: l.to_treat,
+                to_empty: l.to_empty,
+            })
+            .collect();        
+
         let mut nodes = Vec::new();
 
         for node in empty_state_nodes.iter() {
@@ -96,9 +126,8 @@ impl Generator {
         }
     }
 
-    pub fn generate_arcs(&self) -> ArcContainer {
+    pub fn generate_arcs(&self, nodes: &NodeContainer) -> ArcContainer {
         let fragments = self.generate_fragments();
-        let nodes = self.generate_nodes();
 
         let mut arc_container = ArcContainer::new(self.data.clone());
 
@@ -109,14 +138,14 @@ impl Generator {
             for pickup in nodes.pickup_nodes.iter() {
                 let mut extended = f.events.clone();
                 extended.push(Event { request_id: pickup.location, action: Action::PP });
+
+                let start = nodes.pickup_nodes.iter()
+                    .find(|n| n.location == Some(self.data.requests[f.events[0].request_id.unwrap()].from_id))
+                    .unwrap();
                 
                 arc_container.create_arc(
-                    Node { 
-                        location: Some(self.data.requests[f.events[0].request_id.unwrap()].from_id),
-                        to_treat: None, 
-                        to_empty: None
-                    },
-                    pickup.clone(),
+                    *start,
+                    *pickup,
                     done_set,
                     extended,      
                 );   
@@ -133,12 +162,12 @@ impl Generator {
                         let mut extended = f.events.clone();
                         extended.push(Event { request_id: pickup.location, action: Action::PP });
                         
+                        let start = nodes.pickup_nodes.iter()
+                            .find(|n| n.location == Some(self.data.requests[f.events[0].request_id.unwrap()].from_id))
+                            .unwrap();
+
                         arc_container.create_arc(
-                            Node { 
-                                location: Some(self.data.requests[f.events[0].request_id.unwrap()].from_id),
-                                to_treat: None, 
-                                to_empty: None
-                            },
+                            *start,
                             *pickup,
                             done_set_dup,
                             extended,      
@@ -155,12 +184,12 @@ impl Generator {
 
             assert!(second_pickup_index <= 2);
 
-            
-            let late_start_node = Node {
-                location: Some(self.data.requests[f.events[second_pickup_index].request_id.unwrap()].from_id),
-                to_treat: if second_pickup_index == 1 { Some(self.data.requests[f.events[0].request_id.unwrap()].to_id)} else { None},
-                to_empty: Some(self.data.requests[f.events[0].request_id.unwrap()].from_id),
-            };
+            let late_start_node = nodes.nodes.iter()
+                .find(|n| {
+                    n.location == Some(self.data.requests[f.events[second_pickup_index].request_id.unwrap()].from_id) &&
+                    n.to_treat == (if second_pickup_index == 1 { Some(self.data.requests[f.events[0].request_id.unwrap()].to_id)} else { None }) &&
+                    n.to_empty == Some(self.data.requests[f.events[0].request_id.unwrap()].from_id)
+                });
 
             let done_set_no_first_pickup = DoneSet::new(Some(f.events[second_pickup_index].request_id.unwrap()), None);
 
@@ -170,9 +199,9 @@ impl Generator {
                 let mut extended: Vec<Event> = f.events.clone()[second_pickup_index..].to_vec();
                 extended.push(Event { request_id: p.location, action: Action::PP });
 
-                if late_start_node.location != late_start_node.to_empty {
+                if late_start_node.is_some() && late_start_node.unwrap().location != late_start_node.unwrap().to_empty {
                     arc_container.create_arc(
-                        late_start_node,
+                        *late_start_node.unwrap(),
                         *p,
                         done_set_no_first_pickup,
                         extended,
@@ -201,19 +230,17 @@ impl Generator {
                         let mut extended = f.events.clone()[..(first_delivery_index+1)].to_vec();
                         extended.push(Event { request_id: pickup.location, action: Action::PP });
 
-                        let early_finish_node = Node {
-                            location: pickup.location,
-                            to_treat: onboard_transfer_location,
-                            to_empty: onboard_deliver_location,
-                        };
+                        let early_finish_node = nodes.treat_nodes.iter()
+                            .find(|n| n.location == pickup.location && n.to_treat == onboard_transfer_location && n.to_empty == onboard_deliver_location)
+                            .unwrap();
+
+                        let start = nodes.pickup_nodes.iter()
+                            .find(|n| n.location == Some(self.data.requests[f.events[0].request_id.unwrap()].from_id))
+                            .unwrap();
 
                         arc_container.create_arc(
-                            Node {
-                                location: Some(self.data.requests[f.events[0].request_id.unwrap()].from_id),
-                                to_treat: None,
-                                to_empty: None,
-                            },
-                            early_finish_node,
+                            *start,
+                            *early_finish_node,
                             done_set,
                             extended,
                         );
@@ -223,10 +250,10 @@ impl Generator {
                         let mut extended = f.events.clone()[(second_pickup_index)..(first_delivery_index+1)].to_vec();
                         extended.push(Event { request_id: pickup.location, action: Action::PP });
 
-                        if late_start_node.location != late_start_node.to_empty {
+                        if late_start_node.is_some() && late_start_node.unwrap().location != late_start_node.unwrap().to_empty {
                             arc_container.create_arc(
-                                late_start_node,
-                                early_finish_node, 
+                                *late_start_node.unwrap(),
+                                *early_finish_node, 
                                 done_set_no_first_pickup, 
                                 extended);
                         }
@@ -245,17 +272,17 @@ impl Generator {
                     let mut extended = f.events.clone()[..(only_deliver_left+1)].to_vec();
                     extended.push(Event { request_id: pickup.location, action: Action::PP });
 
+                    let start = nodes.pickup_nodes.iter()
+                        .find(|n| n.location == Some(self.data.requests[f.events[0].request_id.unwrap()].from_id))
+                        .unwrap();
+
+                    let end = nodes.deliver_nodes.iter()
+                        .find(|n| n.location == pickup.location && n.to_empty == onboard_deliver_location)
+                        .unwrap();
+
                     arc_container.create_arc(
-                        Node {
-                            location: Some(self.data.requests[f.events[0].request_id.unwrap()].from_id),
-                            to_treat: None,
-                            to_empty: None,
-                        },
-                        Node {
-                            location: pickup.location,
-                            to_treat: None,
-                            to_empty: onboard_deliver_location,
-                        },
+                        *start,
+                        *end,
                         done_set,
                         extended,
                     );
@@ -263,14 +290,10 @@ impl Generator {
                     let mut extended = f.events.clone()[(second_pickup_index)..(only_deliver_left+1)].to_vec();
                     extended.push(Event { request_id: pickup.location, action: Action::PP });
 
-                    if late_start_node.location != late_start_node.to_empty {
+                    if late_start_node.is_some() && late_start_node.unwrap().location != late_start_node.unwrap().to_empty {
                         arc_container.create_arc(
-                            late_start_node,
-                            Node {
-                                location: pickup.location,
-                                to_treat: None,
-                                to_empty: onboard_deliver_location,
-                            },
+                            *late_start_node.unwrap(),
+                            *end,
                             done_set_no_first_pickup,
                             extended,
                         );
@@ -279,11 +302,11 @@ impl Generator {
             }
         }
 
-        for node in nodes.pickup_nodes {
+        for node in nodes.pickup_nodes.iter() {
             if !node.is_depot() {
                 arc_container.create_arc(
                     nodes.depot, 
-                    node, 
+                    *node, 
                     DoneSet::new(None, None),
                     vec!(),
                 );
@@ -605,16 +628,19 @@ pub struct ArcContainer {
     pub arcs: Vec<Arc>,
     pub arcs_from: HashMap<Node, Vec<Arc>>,
     pub arcs_to: HashMap<Node, Vec<Arc>>,
+    pub min_fragment_length: usize,
 }
 
 impl ArcContainer {
     fn new(data: SPDPData) -> Self {
+        let min_fragment_length = data.t_limit;
         ArcContainer {
             data,
             container: HashMap::new(),
             arcs: Vec::new(),
             arcs_from: HashMap::new(),
             arcs_to: HashMap::new(),
+            min_fragment_length,
         }
     }
 
@@ -670,9 +696,15 @@ impl ArcContainer {
                 })
                 .collect();
                 new_arcs.push(arc.clone());
+                if arc.time < self.min_fragment_length && arc.time != 0 {
+                    self.min_fragment_length = arc.time;
+                }
                 self.container.insert(key, new_arcs);
             }
         } else {
+            if arc.time < self.min_fragment_length && arc.time != 0 {
+                self.min_fragment_length = arc.time;
+            }
             self.container.insert(key, vec![arc.clone()]);
 
         }
@@ -740,19 +772,27 @@ mod tests {
     #[test]
     fn test_arc_generation() {
         let spdp = SPDPData::from_file("./SkipData/Testing/small.dat");
-        let arccontainer = Generator::new(spdp).generate_arcs();
+        let gen = Generator::new(spdp);
+        let nodes = gen.generate_nodes();
+        let arccontainer = gen.generate_arcs(&nodes);
         assert_eq!(arccontainer.num_keys(), 48);
 
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_A1.dat");
-        let arccontainer = Generator::new(spdp).generate_arcs();
+        let gen = Generator::new(spdp);
+        let nodes = gen.generate_nodes();
+        let arccontainer = gen.generate_arcs(&nodes);
         assert_eq!(arccontainer.num_arcs(), 579);
 
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_B8.dat");
-        let arccontainer = Generator::new(spdp).generate_arcs();
+        let gen = Generator::new(spdp);
+        let nodes = gen.generate_nodes();
+        let arccontainer = gen.generate_arcs(&nodes);
         assert_eq!(arccontainer.num_arcs(), 22609);
 
         let spdp = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_C10.dat");
-        let arccontainer = Generator::new(spdp).generate_arcs();
+        let gen = Generator::new(spdp);
+        let nodes = gen.generate_nodes();
+        let arccontainer = gen.generate_arcs(&nodes);
         assert_eq!(arccontainer.num_arcs(), 59019);
     }
 }

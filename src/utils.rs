@@ -238,6 +238,7 @@ pub enum Action {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Node {
+    pub id: usize,
     pub location: Option<usize>,
     pub to_treat: Option<usize>,
     pub to_empty: Option<usize>,
@@ -246,6 +247,10 @@ pub struct Node {
 impl Node {
     pub fn is_depot(&self) -> bool {
         self.location.is_none()
+    }
+
+    pub fn is_pickup(&self) -> bool {
+        self.to_treat.is_none() && self.to_empty.is_none()
     }
 }
 
