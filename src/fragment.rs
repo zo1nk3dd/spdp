@@ -1,3 +1,4 @@
+use core::panic;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hasher, Hash};
 
@@ -31,8 +32,16 @@ impl Generator {
             .map(|x| x.from_id)
             .collect::<HashSet<usize>>();
 
+        let mut p_locs: Vec<usize> = p_locs.into_iter().collect();
+        p_locs.sort_unstable();
+
         let mut offset = 1;
-        let mut empty_state_nodes: Vec<Node> = p_locs.iter().enumerate()
+
+        let mut empty_state_nodes = Vec::new();
+
+        empty_state_nodes.push(depot.clone());
+        
+        let pickup_nodes: Vec<Node> = p_locs.iter().enumerate()
             .map(|(idx, l)| Node {
                 id: idx + offset,
                 location: Some(*l),
@@ -41,8 +50,8 @@ impl Generator {
             })
             .collect();
 
-        empty_state_nodes.push(depot.clone());
-        
+        empty_state_nodes.extend(pickup_nodes.iter().cloned());
+
         offset = empty_state_nodes.len();
 
         let mut deliver_nodes: Vec<Node> = p_locs.iter()
@@ -614,6 +623,7 @@ impl DoneSet{
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct NodeContainer {
     pub nodes: Vec<Node>,
     pub pickup_nodes: Vec<Node>,
@@ -655,7 +665,17 @@ impl ArcContainer {
     fn create_arc(&mut self, start: Node, end: Node, done: DoneSet, path: Vec<Event>) {
         let mut time = path.iter()
             .zip(path.iter().skip(1))
-            .map(|(a, b)| self.data.time_between(a, b))
+            .map(|(a, b)| {
+                let mut total = self.data.time_between(a, b);
+                if a.action == Action::Pickup {
+                    total += self.data.t_pickup;
+                } else if a.action == Action::Deliver {
+                    total += self.data.t_delivery;
+                } else if a.action == Action::Treat {
+                    total += self.data.t_empty;
+                }
+                total
+            })
             .sum();
 
         let mut cost = path.iter()
