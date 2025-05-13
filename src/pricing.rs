@@ -116,7 +116,7 @@ impl Label {
 
     fn dominates(&self, other: &Label) -> bool {
         self.reduced_cost <= other.reduced_cost && self.duration <= other.duration 
-            // && self.visits_less_than(other)
+            && self.visits_less_than(other)
     }
 
     fn visits_less_than(&self, other: &Label) -> bool {

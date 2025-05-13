@@ -1,10 +1,17 @@
 use spdp::model::*;
 use spdp::utils::*;
 use std::time::Instant;
+use std::env;
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        println!("Usage: cargo run <instance>");
+        return;
+    }
+    let instance = &args[1];
 
-    let data = SPDPData::from_file("./SkipData/Benchmark/RecDep_day_B11.dat");
+    let data = SPDPData::from_file(&format!("./SkipData/Benchmark/RecDep_day_{}.dat", instance));
 
     let time = Instant::now();
     

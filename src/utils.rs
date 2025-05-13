@@ -19,7 +19,13 @@ pub struct SPDPData {
 
 impl SPDPData {
     pub fn from_file(filename: &str) -> Self {
-        let file = fs::read_to_string(filename).unwrap();
+        let result = fs::read_to_string(filename);
+
+
+        let file = match result {
+            Ok(file) => file,
+            Err(e) => panic!("Error reading file: {}. Probably due to invalid instance provided.", e),
+        };
 
         let mut lines = file.lines();
 
