@@ -1,12 +1,9 @@
 extern crate grb;
-
-use std::iter;
-
+use grb::attribute::ConstrDoubleAttr::RHS;
 use grb::attribute::ModelDoubleAttr::ObjVal;
 use grb::attribute::ModelModelSenseAttr::ModelSense;
 use grb::attribute::VarDoubleAttr::Obj;
 use grb::attribute::VarDoubleAttr::X;
-use grb::parameter::IntParam::OutputFlag;
 use grb::prelude::*;
 
 use super::utils::*;
@@ -141,7 +138,7 @@ impl ColGenModel {
         }
     }
 
-    fn print_solution(&self) {
+    fn _print_solution(&self) {
         let obj = self.model.get_attr(ObjVal).unwrap();
         println!("Objective value: {:?}", obj);
 
@@ -162,10 +159,27 @@ impl ColGenModel {
         let mut iter = 1;
         let mut best_vehicle_count = 0;
 
+        let mut mode = DominanceMode {
+            rc: true,
+            duration: true,
+            coverage: false,
+        };
+
         loop {
             self.model.update().unwrap();
-            let result = self.model.optimize();
-            assert!(result.is_ok());
+            self.model.optimize().unwrap();
+
+            let result = self.model.get_attr(attr::Status).unwrap();
+            
+            if result == grb::Status::Infeasible {
+                if self.vehicle_constraint.is_some() {
+                    println!("No feasible solution found after {} iterations\n", iter);
+                    println!("\n\nUpdating vehicle count\n\n");
+                    best_vehicle_count += 1;
+                    self.model.set_obj_attr(RHS, &self.vehicle_constraint.unwrap(), best_vehicle_count as f64).unwrap();
+                    continue;
+                }
+            }
 
             let cover_duals = self.cover_constraints.iter()
                 .map(|c| self.model.get_obj_attr(attr::Pi, c).unwrap())
@@ -182,12 +196,13 @@ impl ColGenModel {
                 print!("VEHICLE PI: {:?}\n", vehicle_dual);
             }
 
-            let mut pricer = Pricer::new(
+            let mut pricer = BucketPricer::new(
                 &self.nodes, 
                 &self.arcs, 
                 &self.data,
                 &cover_duals,
                 &vehicle_dual,
+                mode,
             );
 
             let new_routes = pricer.solve_pricing_problem(10);
@@ -211,7 +226,11 @@ impl ColGenModel {
 
             else if new_routes.len() == 0 && self.max_vehicles.is_some() {
                 print!("Optimal obj {} found after {} iterations\n", self.model.get_attr(ObjVal).unwrap(), iter);
-                // self.print_solution();
+                if !mode.coverage {
+                    println!("\n\nAdding dominance checks for coverage\n\n");
+                    mode.coverage = true;
+                    continue;
+                }
                 break;
             }
 
