@@ -5,3 +5,6 @@ edition = "2021"
 
 [dependencies]
 grb = { version = "3.0.1", features = ["gurobi12"] }
+
+[profile.release]
+debug = true

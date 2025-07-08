@@ -1,9 +1,12 @@
 extern crate grb;
+use core::panic;
+
 use grb::attribute::ConstrDoubleAttr::RHS;
 use grb::attribute::ModelDoubleAttr::ObjVal;
 use grb::attribute::ModelModelSenseAttr::ModelSense;
 use grb::attribute::VarDoubleAttr::Obj;
 use grb::attribute::VarDoubleAttr::X;
+use grb::parameter::IntParam::OutputFlag;
 use grb::prelude::*;
 
 use super::utils::*;
@@ -37,7 +40,7 @@ pub struct ColGenModel {
 }
 
 impl ColGenModel {
-    pub fn new(data: SPDPData, max_vehicles: Option<usize>) -> Self {
+    pub fn new(data: SPDPData) -> Self {
         let generator = Generator::new(data.clone());
 
         let node_container = generator.generate_nodes();
@@ -55,7 +58,7 @@ impl ColGenModel {
             route_costs: Vec::new(),
             cover_constraints: Vec::new(),
             vehicle_constraint: None,
-            max_vehicles,
+            max_vehicles: None,
         };
 
         result.first_initialisation();
@@ -152,18 +155,15 @@ impl ColGenModel {
         }
     }
 
-    pub fn solve(&mut self) {
-        // self.model.set_param(OutputFlag, 0).unwrap();
+    pub fn solve(&mut self, verbose: bool) {
+        self.model.set_param(OutputFlag, 0).unwrap();
         self.model.set_attr(ModelSense, Minimize).unwrap();
 
         let mut iter = 1;
+
         let mut best_vehicle_count = 0;
 
-        let mut mode = DominanceMode {
-            rc: true,
-            duration: true,
-            coverage: false,
-        };
+        let mut mode = LPSolvePhase::VehicleNoCover;
 
         loop {
             self.model.update().unwrap();
@@ -174,16 +174,21 @@ impl ColGenModel {
             if result == grb::Status::Infeasible {
                 if self.vehicle_constraint.is_some() {
                     println!("No feasible solution found after {} iterations\n", iter);
-                    println!("\n\nUpdating vehicle count\n\n");
+                    println!("Updating vehicle count");
                     best_vehicle_count += 1;
                     self.model.set_obj_attr(RHS, &self.vehicle_constraint.unwrap(), best_vehicle_count as f64).unwrap();
                     continue;
                 }
+            } else {
+                let obj = self.model.get_attr(attr::ObjVal).unwrap();
+                println!("OBJVAL: {:?}", obj);
             }
 
             let cover_duals = self.cover_constraints.iter()
                 .map(|c| self.model.get_obj_attr(attr::Pi, c).unwrap())
                 .collect::<Vec<_>>();
+
+            // println!("Cover duals: {:?}", cover_duals);
 
             let vehicle_dual = if self.max_vehicles.is_some() {
                 Some(self.model.get_obj_attr(attr::Pi, self.vehicle_constraint.as_ref().unwrap()).unwrap())
@@ -191,68 +196,115 @@ impl ColGenModel {
                 None
             };
 
-            print!("\nCOVER PI: {:?}\n", cover_duals);
-            if let Some(vehicle_dual) = vehicle_dual {
-                print!("VEHICLE PI: {:?}\n", vehicle_dual);
-            }
+            let raw_ref: *mut ColGenModel = self;
 
-            let mut pricer = BucketPricer::new(
-                &self.nodes, 
-                &self.arcs, 
-                &self.data,
-                &cover_duals,
-                &vehicle_dual,
-                mode,
-            );
+            let mut pricer: Box<dyn Pricer> = if vehicle_dual.is_some() {
+                Box::new(QueuePricer::new(
+                    &self.nodes, 
+                    &self.arcs, 
+                    &self.data,
+                    &cover_duals,
+                    &vehicle_dual,
+                    mode,
+                ))
+            } else {
+                Box::new(QueuePricer::new(
+                    &self.nodes, 
+                    &self.arcs, 
+                    &self.data,
+                    &cover_duals,
+                    &vehicle_dual, 
+                    mode,
+                ))
+            };
 
-            let new_routes = pricer.solve_pricing_problem(10);
+            let new_routes = pricer.solve_pricing_problem(10, verbose);
 
-            if new_routes.len() == 0 && self.max_vehicles.is_none() {
-                print!("Optimal obj found after {} iterations\n", iter);
-                let obj = self.model.get_attr(attr::ObjVal).unwrap();
-                println!("Objective value: {:?}\n", obj);
-                best_vehicle_count = obj.ceil() as usize;
-                self.max_vehicles = Some(best_vehicle_count);
+            if new_routes.is_empty() {
+                println!("No new routes found");
+                match mode {
+                    LPSolvePhase::VehicleNoCover => {
+                        mode = LPSolvePhase::VehicleCover;
+                        println!("Adding coverage checks for vehicles");
+                    },
+                    LPSolvePhase::VehicleCover => {
+                        mode = LPSolvePhase::CostNoCover;
+                        println!("Optimal number of vehicles found after {} iterations", iter);
+                        let obj = self.model.get_attr(attr::ObjVal).unwrap();
+                        best_vehicle_count = obj.ceil() as usize;
+                        self.max_vehicles = Some(best_vehicle_count);
 
-                self.vehicle_constraint = Some(self.model.add_constr(
-                    "vehicle_constraint",
-                    c!(self.lambda.iter().grb_sum() == best_vehicle_count as f64)
-                ).unwrap());
+                        self.vehicle_constraint = Some(self.model.add_constr(
+                            "vehicle_constraint",
+                            c!(self.lambda.iter().grb_sum() == best_vehicle_count as f64)
+                        ).unwrap());
 
-                for (idx, var) in self.lambda.iter().enumerate() {
-                    self.model.set_obj_attr(attr::Obj, var, self.route_costs[idx]).unwrap();
+                        for (idx, var) in self.lambda.iter().enumerate() {
+                            self.model.set_obj_attr(attr::Obj, var, self.route_costs[idx]).unwrap();
+                        }
+
+                        println!("\nCOST OPTIMIZATION PHASE");
+                    },
+                    LPSolvePhase::CostNoCover => {
+                        mode = LPSolvePhase::CostCover;
+                        println!("Adding coverage checks for costs");
+                    },
+                    LPSolvePhase::CostCover => {
+                        // Successfully solved the second phase of the problem
+                        println!("Optimal obj {} found after {} iterations", self.model.get_attr(ObjVal).unwrap(), iter);
+                        break;
+                    },
                 }
             }
 
-            else if new_routes.len() == 0 && self.max_vehicles.is_some() {
-                print!("Optimal obj {} found after {} iterations\n", self.model.get_attr(ObjVal).unwrap(), iter);
-                if !mode.coverage {
-                    println!("\n\nAdding dominance checks for coverage\n\n");
-                    mode.coverage = true;
-                    continue;
-                }
-                break;
-            }
+            // if new_routes.is_empty() && !mode.coverage {
+            //     // Need to do the coverage dominance case
+            //     mode.coverage = true;
+            //     println!("\n\nAdding dominance checks for coverage\n");
+            // }
+
+            // else if new_routes.is_empty() && self.max_vehicles.is_none() {
+            //     // Successfully solved the first phase of the problem
+            //     print!("Optimal number of vehicles found after {} iterations\n", iter);
+            //     let obj = self.model.get_attr(attr::ObjVal).unwrap();
+            //     println!("Objective value: {:?}\n", obj);
+            //     best_vehicle_count = obj.ceil() as usize;
+            //     self.max_vehicles = Some(best_vehicle_count);
+
+            //     self.vehicle_constraint = Some(self.model.add_constr(
+            //         "vehicle_constraint",
+            //         c!(self.lambda.iter().grb_sum() == best_vehicle_count as f64)
+            //     ).unwrap());
+
+            //     for (idx, var) in self.lambda.iter().enumerate() {
+            //         self.model.set_obj_attr(attr::Obj, var, self.route_costs[idx]).unwrap();
+            //     }
+
+            //     mode.coverage = false;
+            //     continue;
+            // }
+
+            // else if new_routes.is_empty() && self.max_vehicles.is_some() {
+            //     // Successfully solved the second phase of the problem
+            //     print!("Optimal obj {} found after {} iterations\n", self.model.get_attr(ObjVal).unwrap(), iter);
+            //     break;
+            // }
 
             else {         
-                print!("Objective value: {}\n", self.model.get_attr(attr::ObjVal).unwrap());  
-
-                if self.max_vehicles.is_some() {
-                    for r_id in 0..self.lambda.len() {
-                        let covered: Vec<f64> = (0..self.data.num_requests).map(|idx| self.model.get_coeff(&self.lambda[r_id], &self.cover_constraints[idx]).unwrap()).collect();
-                        // print!("Variable: {:?}, value: {:?}, covered: {:?}, cost: {:?}\n", r_id, self.model.get_obj_attr(X, &self.lambda[r_id]).unwrap(), covered, self.model.get_obj_attr(attr::Obj, &self.lambda[r_id]).unwrap());
-                    }
-                }
+                println!("Adding {} new routes", new_routes.len());
 
                 for route in new_routes.iter() {
                     let cost = route.cost as f64;
-                    let covered = route.covered.clone();
+                    let covered = route.coverset.covered.clone();
                     let reduced_cost = route.reduced_cost;
-                    self.add_route_var(cost, covered);
-                    print!("New route found with cost: {:?}, rc {} and covered requests: {:?}\n", cost, reduced_cost, route.covered);
+                    unsafe {
+                        raw_ref.as_mut().unwrap().add_route_var(cost, covered);
+                    }
+                    println!("COST: {}, RC: {:.4}, COVER: {:?}", cost, reduced_cost, route.coverset.covered);
                 }
             }
             iter += 1;
+            println!();
         }
     }
 }

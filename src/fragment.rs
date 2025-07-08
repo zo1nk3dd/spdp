@@ -748,6 +748,13 @@ impl ArcContainer {
                 self.arcs_to.insert(arc.end, vec![new_arc.clone()]);
             }
         }
+
+        for k in self.arcs_from.keys() {
+            self.arcs_to.get_mut(k).unwrap().sort_by(|a, b| a.time.cmp(&b.time));
+        }
+        for k in self.arcs_to.keys() {
+            self.arcs_from.get_mut(k).unwrap().sort_by(|a, b| a.time.cmp(&b.time));
+        }
     }
 }
 
