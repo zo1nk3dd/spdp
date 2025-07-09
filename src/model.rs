@@ -1,5 +1,4 @@
 extern crate grb;
-use core::panic;
 
 use grb::attribute::ConstrDoubleAttr::RHS;
 use grb::attribute::ModelDoubleAttr::ObjVal;
@@ -188,7 +187,7 @@ impl ColGenModel {
                 .map(|c| self.model.get_obj_attr(attr::Pi, c).unwrap())
                 .collect::<Vec<_>>();
 
-            // println!("Cover duals: {:?}", cover_duals);
+            println!("Cover duals: {:?}", cover_duals);
 
             let vehicle_dual = if self.max_vehicles.is_some() {
                 Some(self.model.get_obj_attr(attr::Pi, self.vehicle_constraint.as_ref().unwrap()).unwrap())
@@ -218,7 +217,7 @@ impl ColGenModel {
                 ))
             };
 
-            let new_routes = pricer.solve_pricing_problem(10, verbose);
+            let new_routes = pricer.solve_pricing_problem(20, verbose);
 
             if new_routes.is_empty() {
                 println!("No new routes found");
@@ -295,12 +294,12 @@ impl ColGenModel {
 
                 for route in new_routes.iter() {
                     let cost = route.cost as f64;
-                    let covered = route.coverset.covered.clone();
+                    let covered = route.coverset.to_vec();
                     let reduced_cost = route.reduced_cost;
                     unsafe {
                         raw_ref.as_mut().unwrap().add_route_var(cost, covered);
                     }
-                    println!("COST: {}, RC: {:.4}, COVER: {:?}", cost, reduced_cost, route.coverset.covered);
+                    if verbose { println!("COST: {}, RC: {:.4}, COVER: {:?}", cost, reduced_cost, route.coverset.to_vec()); }
                 }
             }
             iter += 1;
