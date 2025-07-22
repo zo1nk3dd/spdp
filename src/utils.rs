@@ -1,5 +1,8 @@
-use std::fs;
+use std::{fmt, fs};
+use crate::{coverset::CoverSet, pricing::DominanceMode};
+
 use super::locset::Locset;
+use super::constants::EPS;
 
 #[derive(Debug, Clone)]
 pub struct SPDPData {
@@ -257,6 +260,76 @@ impl Node {
 
     pub fn is_pickup(&self) -> bool {
         self.to_treat.is_none() && self.to_empty.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Label {
+    pub id: usize,
+    pub reduced_cost: f64,
+    pub duration: usize,
+    pub predecessor: usize,
+    pub cost: usize,
+    pub coverset: CoverSet,
+    pub node_id: usize,
+}
+
+impl Eq for Label {}
+
+impl Ord for Label {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.duration.cmp(&self.duration)
+    }
+}
+
+impl PartialOrd for Label {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Label {
+    pub fn new(id: usize, reduced_cost: f64, duration: usize, predecessor: usize, cost: usize, coverset: CoverSet, node_id: usize,) -> Self {    
+        Label {
+            id,
+            reduced_cost,
+            duration,
+            predecessor,
+            cost,
+            coverset,
+            node_id,
+        }
+    }
+
+    pub fn dominates(&self, other: &Label, mode: DominanceMode) -> bool {
+        match mode {
+            DominanceMode::RC => {
+                self.reduced_cost - other.reduced_cost < EPS
+            },
+            DominanceMode::DurRC => {
+                self.reduced_cost - other.reduced_cost < EPS && self.duration <= other.duration
+            },
+            DominanceMode::DurRCCover => {
+                self.reduced_cost - other.reduced_cost < EPS && self.duration <= other.duration && self.coverset.visits_leq_than(&other.coverset)
+            },
+            DominanceMode::Dur => {
+                self.duration <= other.duration
+            },
+            DominanceMode::DurRCQuantity => {
+                self.reduced_cost - other.reduced_cost < EPS && self.duration <= other.duration && self.coverset.len <= other.coverset.len
+            }
+        }
+    }
+
+    fn visits_less_eq_than(&self, other: &Label) -> bool {
+        self.coverset.visits_leq_than(&other.coverset)
+    }
+}
+
+impl fmt::Display for Label {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "rc: {:.2}, d: {}, node: {:?}", 
+            self.reduced_cost, self.duration, self.node_id)
     }
 }
 

@@ -1,9 +1,7 @@
 use std::sync::OnceLock;
-
 use crate::utils::SPDPData;
+use crate::constants::SIZE;
 
-
-pub type SIZE = u64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverSetManager {
     offsets: Vec<usize>,
@@ -52,6 +50,7 @@ impl CoverSetManager {
 pub struct CoverSet {
     pub covered: SIZE, // This should be big enough for 64 requests, especially with duplicates
     manager: &'static CoverSetManager,
+    pub len: usize,
 }
 
 impl CoverSet {
@@ -59,17 +58,47 @@ impl CoverSet {
         CoverSet { 
             covered: 0,
             manager,
+            len: 0,
         }
     }
 
-    pub fn cover(&mut self, request_id: usize) {
+    pub fn cover(&mut self, request_id: usize) -> Result<(), ()> {
         self.covered += 1 << self.manager.offsets[request_id];
+
+        if self.is_valid() {
+            self.len += 1; // Increment length only if valid
+            Ok(())
+        } else {
+            self.covered -= 1 << self.manager.offsets[request_id]; // Rollback if invalid
+            Err(())
+        }
+    }
+
+    pub fn uncover(&mut self, request_id: usize) -> Result<(), ()> {
+        match self.covered.checked_sub(1 << self.manager.offsets[request_id]) {
+            Some(new_covered) => {
+                self.covered = new_covered;
+                self.len -= 1;
+            },
+            None => {
+                return Err(()); // Cannot uncover if it would result in negative coverage
+            }
+        }
+
+        if self.is_valid() {
+            Ok(())
+        } else {
+            self.len += 1;
+            self.covered += 1 << self.manager.offsets[request_id]; // Rollback if invalid
+            Err(())
+        }
     }
 
     pub fn combine(self, other: &CoverSet) -> Result<Self, String> {
         let new = CoverSet {
             covered: self.covered + other.covered,
             manager: self.manager,
+            len: self.len + other.len,
         };
 
         if new.is_valid() {
@@ -79,7 +108,7 @@ impl CoverSet {
         }
     }
 
-    pub fn is_valid(&self) -> bool {
+    fn is_valid(&self) -> bool {
         let overflow_flag = (self.covered + self.manager.overflow_add) & self.manager.overflow_flag_mask;
         overflow_flag == 0
     }
@@ -129,6 +158,8 @@ pub fn init_manager(data: &SPDPData) -> &'static CoverSetManager {
 
 #[cfg(test)]
 mod tests {
+    use crate::coverset;
+
     use super::*;
 
     fn setup() {
@@ -148,16 +179,27 @@ mod tests {
         setup();
         let manager = get_manager();
         let mut cover_set = CoverSet::new(&manager);
-        cover_set.cover(0);
+        assert!(cover_set.cover(0).is_ok());
+        assert!(cover_set.cover(1).is_ok());
+        assert!(cover_set.cover(0).is_err());
         assert!(cover_set.is_valid());
-        cover_set.cover(1);
+        assert!(cover_set.cover(2).is_ok());
+        assert!(cover_set.cover(2).is_ok());
+        assert!(cover_set.cover(2).is_err());
         assert!(cover_set.is_valid());
-        cover_set.cover(0);
-        assert!(!cover_set.is_valid());
-        cover_set.cover(2);
-        cover_set.cover(2);
-        cover_set.cover(2);
-        assert!(!cover_set.is_valid());
+    }
+
+    #[test]
+    fn test_cover_set_uncover() {
+        setup();
+        let manager = get_manager();
+        let mut cover_set = CoverSet::new(&manager);
+        assert!(cover_set.cover(0).is_ok());
+        assert!(cover_set.cover(1).is_ok());
+        assert!(cover_set.uncover(0).is_ok());
+        assert!(cover_set.uncover(1).is_ok());
+        assert!(cover_set.uncover(2).is_err());
+        assert!(cover_set.is_valid());
     }
 
     #[test]
@@ -165,18 +207,18 @@ mod tests {
         setup();
         let manager: &'static CoverSetManager = get_manager();
         let mut cover_set1 = CoverSet::new(&manager);
-        cover_set1.cover(0);
-        cover_set1.cover(1);
+        assert!(cover_set1.cover(0).is_ok());
+        assert!(cover_set1.cover(1).is_ok());
         
         let mut cover_set2 = CoverSet::new(&manager);
-        cover_set2.cover(0);
-        cover_set2.cover(1);
-        cover_set2.cover(2);
+        assert!(cover_set2.cover(0).is_ok());
+        assert!(cover_set2.cover(1).is_ok());
+        assert!(cover_set2.cover(2).is_ok());
 
         let mut cover_set3 = CoverSet::new(&manager);
-        cover_set3.cover(0);
-        cover_set3.cover(3);
-        cover_set3.cover(4);
+        assert!(cover_set3.cover(0).is_ok());
+        assert!(cover_set3.cover(3).is_ok());
+        assert!(cover_set3.cover(4).is_ok());
 
         assert!(cover_set1.visits_leq_than(&cover_set2));
         assert!(!cover_set2.visits_leq_than(&cover_set1));
@@ -189,10 +231,10 @@ mod tests {
         setup();
         let manager: &'static CoverSetManager = get_manager();
         let mut cover_set = CoverSet::new(&manager);
-        cover_set.cover(0);
-        cover_set.cover(1);
-        cover_set.cover(2);
-        cover_set.cover(5);
+        assert!(cover_set.cover(0).is_ok());
+        assert!(cover_set.cover(1).is_ok());
+        assert!(cover_set.cover(2).is_ok());
+        assert!(cover_set.cover(5).is_ok());
         
         let vec = cover_set.to_vec();
         assert_eq!(vec, vec![1, 1, 1, 0, 0, 1, 0, 0]); // Assuming the first three requests are covered

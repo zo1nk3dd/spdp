@@ -11,6 +11,7 @@ use grb::prelude::*;
 use super::utils::*;
 use super::fragment::*;
 use super::pricing::*;
+use super::constants::*;
 
 
 pub struct MasterProblemModel {
@@ -111,7 +112,7 @@ impl ColGenModel {
 
                 self.model.add_constr(
                     &format!("request_{}", request_id),
-                    c!(constr_expr == self.data.requests[request_id].quantity as f64)
+                    c!(constr_expr >= self.data.requests[request_id].quantity as f64)
                 ).unwrap()
             })
             .collect::<Vec<_>>();
@@ -164,6 +165,8 @@ impl ColGenModel {
 
         let mut mode = LPSolvePhase::VehicleNoCover;
 
+        let mut route_pool: Vec<Label> = Vec::new();
+
         loop {
             self.model.update().unwrap();
             self.model.optimize().unwrap();
@@ -178,53 +181,138 @@ impl ColGenModel {
                     self.model.set_obj_attr(RHS, &self.vehicle_constraint.unwrap(), best_vehicle_count as f64).unwrap();
                     continue;
                 }
-            } else {
-                let obj = self.model.get_attr(attr::ObjVal).unwrap();
-                println!("OBJVAL: {:?}", obj);
             }
 
-            let cover_duals = self.cover_constraints.iter()
-                .map(|c| self.model.get_obj_attr(attr::Pi, c).unwrap())
-                .collect::<Vec<_>>();
-
-            println!("Cover duals: {:?}", cover_duals);
-
-            let vehicle_dual = if self.max_vehicles.is_some() {
-                Some(self.model.get_obj_attr(attr::Pi, self.vehicle_constraint.as_ref().unwrap()).unwrap())
+            let mut new_routes: Vec<Label> = Vec::new();            
+            let obj = self.model.get_attr(attr::ObjVal).unwrap();
+            println!("OBJVAL: {:?}", obj);
+            if self.vehicle_constraint.is_none() && obj - EPS < 1.0 {
+                if verbose {
+                    println!("Smallest possible vehicles count of 1 is found");
+                }
+                mode = LPSolvePhase::VehicleCover; // This will skip straight to cost optimization
             } else {
-                None
-            };
+                let cover_duals = self.cover_constraints.iter()
+                    .map(|c| self.model.get_obj_attr(attr::Pi, c).unwrap())
+                    .collect::<Vec<_>>();
 
-            let raw_ref: *mut ColGenModel = self;
+                let vehicle_dual = if self.max_vehicles.is_some() {
+                    Some(self.model.get_obj_attr(attr::Pi, self.vehicle_constraint.as_ref().unwrap()).unwrap())
+                } else {
+                    None
+                };
 
-            let mut pricer: Box<dyn Pricer> = if vehicle_dual.is_some() {
-                Box::new(QueuePricer::new(
-                    &self.nodes, 
-                    &self.arcs, 
-                    &self.data,
-                    &cover_duals,
-                    &vehicle_dual,
-                    mode,
-                ))
-            } else {
-                Box::new(QueuePricer::new(
-                    &self.nodes, 
-                    &self.arcs, 
-                    &self.data,
-                    &cover_duals,
-                    &vehicle_dual, 
-                    mode,
-                ))
-            };
+                if verbose {
+                    println!("Cover duals: {:?}", cover_duals);
+                    if let Some(dual) = vehicle_dual {
+                        println!("Vehicle dual: {:?}", dual);
+                    }
+                }
 
-            let new_routes = pricer.solve_pricing_problem(20, verbose);
+                // Check the route pool for any candidate routes
+
+                for label in route_pool.iter() {
+                    let reduced_cost = match mode {
+                        LPSolvePhase::VehicleNoCover | LPSolvePhase::VehicleCover => {
+                            1.0 - label.coverset.to_vec().iter().enumerate()
+                                .map(|(idx, amount)| *amount as f64 * cover_duals[idx])
+                                .sum::<f64>()
+                        },
+                        LPSolvePhase::CostNoCover | LPSolvePhase::CostCover => {
+                            self.data.fixed_vehicle_cost as f64
+                                - label.coverset.to_vec().iter().enumerate()
+                                    .map(|(idx, amount)| *amount as f64 * cover_duals[idx])
+                                    .sum::<f64>()
+                                + label.cost as f64
+                                - vehicle_dual.unwrap_or(0.0)
+                        },
+                    };
+
+                    if reduced_cost < -EPS {
+                        if verbose {
+                            println!("Route from pool with reduced cost: {:.4}", reduced_cost);
+                        }
+                        new_routes.push(Label {
+                            id: label.id,
+                            reduced_cost,
+                            duration: label.duration,
+                            predecessor: label.predecessor,
+                            cost: label.cost,
+                            coverset: label.coverset,
+                            node_id: label.node_id,
+                        });
+                    }
+                }
+
+                if !new_routes.is_empty() {
+                    if verbose {
+                        println!("Found {} candidate routes in the pool", new_routes.len());
+                        // panic!("Candidate routes found in the pool, not implemented yet");
+                    }
+                } else {
+                    if verbose {
+                        println!("No candidate routes found in the pool");
+                    }
+
+                    let mut pricer: Box<dyn Pricer> = Box::new(BucketPricer::new(
+                        &self.data,
+                        &self.nodes,
+                        &self.arcs,
+                        cover_duals,
+                        vehicle_dual,
+                        mode,
+                    ));
+
+                    let mut candidates = pricer.solve_pricing_problem(verbose);
+
+                    for node_id in 0..self.nodes.nodes.len() {
+                        let node_routes = &mut candidates[node_id];
+                        
+                        node_routes.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
+
+                        for i in 0..NUM_ROUTES_PER_NODE_ADDED {
+                            let label = if i < node_routes.len() {
+                                node_routes[i]
+                            } else {
+                                break;
+                            };
+
+                            new_routes.push(label);
+                        }
+
+                        for i in NUM_ROUTES_PER_NODE_ADDED..NUM_ROUTES_PER_NODE_CALCULATED {
+                            if i < node_routes.len() {
+                                let label = node_routes[i];
+                                route_pool.push(label);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+
+                    // if self.vehicle_constraint.is_none() && !new_routes.is_empty() {
+                    //     let obj = self.model.get_attr(attr::ObjVal).unwrap();
+                    //     let best_rc = new_routes.iter()
+                    //         .map(|r| r.reduced_cost)
+                    //         .min_by(|a, b| a.partial_cmp(b).unwrap())
+                    //         .unwrap();
+                    //     let reduction_till_jump = obj - obj.floor() - EPS;
+                    //     if reduction_till_jump >= -best_rc * 2.0 {
+                    //         println!("New routes can't improve the objective value enough");
+                    //         println!("Current objective value: {}, best reduced cost: {}", obj, best_rc);
+                    //         new_routes.clear();
+                    //     }
+                    // }
+                }
+            }
 
             if new_routes.is_empty() {
                 println!("No new routes found");
                 match mode {
                     LPSolvePhase::VehicleNoCover => {
                         mode = LPSolvePhase::VehicleCover;
-                        println!("Adding coverage checks for vehicles");
+                        println!("Adding quantity checks for vehicles");
                     },
                     LPSolvePhase::VehicleCover => {
                         mode = LPSolvePhase::CostNoCover;
@@ -235,7 +323,7 @@ impl ColGenModel {
 
                         self.vehicle_constraint = Some(self.model.add_constr(
                             "vehicle_constraint",
-                            c!(self.lambda.iter().grb_sum() == best_vehicle_count as f64)
+                            c!(self.lambda.iter().grb_sum() >= best_vehicle_count as f64)
                         ).unwrap());
 
                         for (idx, var) in self.lambda.iter().enumerate() {
@@ -291,7 +379,7 @@ impl ColGenModel {
 
             else {         
                 println!("Adding {} new routes", new_routes.len());
-
+                let raw_ref: *mut ColGenModel = self;
                 for route in new_routes.iter() {
                     let cost = route.cost as f64;
                     let covered = route.coverset.to_vec();

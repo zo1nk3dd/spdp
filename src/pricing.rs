@@ -1,11 +1,12 @@
-use std::cmp::{min, Ordering};
+use std::cmp::{min};
 use std::collections::{BinaryHeap, HashMap};
-use std::io::Write;
-use std::{f64, fmt, io, panic, vec};
+use std::fmt::Display;
+use std::{f64, fmt, vec};
 
 use crate::fragment::{Arc, ArcContainer, NodeContainer};
-use crate::utils::{SPDPData};
-use crate::coverset::{get_manager, init_manager, CoverSet, CoverSetManager, SIZE};
+use crate::utils::{SPDPData, Label};
+use crate::coverset::{get_manager, init_manager, CoverSet};
+use crate::constants::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DominanceMode {
@@ -13,6 +14,7 @@ pub enum DominanceMode {
     DurRC,
     DurRCCover,
     Dur,
+    DurRCQuantity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,41 +31,10 @@ struct Key {
     node_id: usize,
 }
 
-// #[derive(Debug, Clone, Eq, PartialEq)]
-// pub struct CoverSet {
-//     pub covered: Vec<usize>,
-// }
-
-// impl CoverSet {
-//     fn visits_leq_than(&self, other: &CoverSet) -> bool {
-//         self.covered.iter().zip(other.covered.iter()).all(|(a, b)| a <= b)
-//     }
-// }
-
-// impl PartialOrd for CoverSet {
-//     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-//         Some(self.cmp(other))
-//     }
-// }
-
-// impl Ord for CoverSet {
-//     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-//         // Compare based on the number of covered requests
-//         for (a, b) in self.covered.iter().zip(&other.covered) {
-//             if a < b {
-//                 return Ordering::Less;
-//             }
-//             else if a > b {
-//                 return Ordering::Greater;
-//             }
-//         }
-//         Ordering::Equal
-//     }
-// }
-
 #[derive(Debug, Clone)]
 struct VisitedData {
     pub visited: Vec<HashMap<SIZE, Vec<usize>>>,
+    pub depot_labels: Vec<usize>,
     pub labels: Vec<Label>,
     pub cut_in: usize,
     pub cut_out: usize,
@@ -74,6 +45,7 @@ impl VisitedData {
     fn new(num_nodes: usize) -> Self {
         VisitedData {
             visited: vec![HashMap::new(); num_nodes],
+            depot_labels: Vec::new(),
             labels: Vec::new(),
             cut_in: 0,
             cut_out: 0,
@@ -122,12 +94,31 @@ impl VisitedData {
         true
     }
 
-    fn add_if_improvement(&mut self, label: Label, phase: LPSolvePhase) -> bool {        
+    fn contains_label(&self, label: &Label, phase: LPSolvePhase) -> bool {
+        let bucket = &self.visited[label.node_id];
+        let key = match phase {
+            LPSolvePhase::VehicleNoCover | LPSolvePhase::CostNoCover => 0,
+            LPSolvePhase::VehicleCover | LPSolvePhase::CostCover => label.coverset.covered,
+        };
+        if let Some(label_ids) = bucket.get(&key) {
+            return label_ids.iter().any(|id| *id == label.id);
+        }
+        false
+    }
+
+    /// Attempts to add a label to the visited data structure, and returns the result
+    fn add_if_improvement(&mut self, label: Label, phase: LPSolvePhase) -> bool {       
+        if label.node_id == 0 {
+            // If the label is for the depot, we add it to the depot labels
+            self.depot_labels.push(label.id);
+            self.labels.push(label);
+            return true; // Depot labels are always considered improvements
+        } 
         let bucket = &mut self.visited[label.node_id];
+        assert!(self.labels.len() == label.id);
         // assert!(bucket.iter().all(|l| !l.is_empty()), "Bucket should not contain empty labels");
 
         if bucket.is_empty() {
-            assert!(self.labels.len() == label.id);
             bucket.insert(label.coverset.covered, vec![label.id]);
             self.labels.push(label);
             return true; // If no labels visited, this is an improvement
@@ -135,18 +126,79 @@ impl VisitedData {
 
         // Vehicle No Cover, we want to store only the best reduced cost label at each node
         if phase == LPSolvePhase::VehicleNoCover || phase == LPSolvePhase::CostNoCover {
-            let prev_label = &self.labels[bucket.values().next().unwrap()[0]];
-            if label.dominates(prev_label, DominanceMode::DurRC) {
-                bucket.remove(&prev_label.coverset.covered);
-                bucket.insert(label.coverset.covered, vec![label.id]);
-                self.cut_out += 1;
-                self.better += 1; // Count this as a better label
+            // assert!(bucket.len() == 1, "Bucket should contain only one label for VehicleNoCover or CostNoCover phase");
+            let label_ids = bucket.get_mut(&0);
 
-            } else {
-                self.cut_in += 1;
-                return false; // If the new label does not dominate the best label, it's not an improvement
+            if let Some(label_ids) = label_ids {
+                // println!("Adding label to bucket: {:?}", label_ids);
+                // This cover set has been previously found
+                for label_id in label_ids.iter() {
+                    if self.labels[*label_id].dominates(&label, DominanceMode::DurRC) {
+                        // println!("Label with rc {:?} and dur {} dominates rc {} and dur {:?}", 
+                        //     self.labels[*label_id].reduced_cost, self.labels[*label_id].duration,
+                        //     label.reduced_cost, label.duration);
+                        self.cut_in += 1;
+                        return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+                    }
+                }
+                // label_ids.retain(|id| {
+                //     // Remove dominated labels
+                //     !label.dominates(&self.labels[*id], DominanceMode::DurRC)
+                // });
+                label_ids.push(label.id);
+                self.labels.push(label);
+                return true;
+            }
+
+            else {
+                // This cover set has not been found before
+                self.better += 1; // Count this as a better label
+                bucket.insert(0, vec![label.id]);
+                self.labels.push(label); // Add the label to the labels vector
+                return true;
             }
         }
+        // else if phase == LPSolvePhase::VehicleQuantity {
+        //     let result = bucket.get(&(label.coverset.len as SIZE));
+
+        //     if let Some(label_ids) = result {
+        //         for id in label_ids.iter() {
+        //             if self.labels[*id].dominates(&label, DominanceMode::RC) {
+        //                 self.cut_in += 1;
+        //                 return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+        //             }
+        //         }
+        //     }
+        //     if label.coverset.len > 1 {
+        //         let result = bucket.get(&(label.coverset.len as SIZE - 1));
+        //         if let Some(label_ids) = result {
+        //             for id in label_ids.iter() {
+        //                 if self.labels[*id].dominates(&label, DominanceMode::RC) {
+        //                     self.cut_in += 1;
+        //                     return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+        //                 }
+        //             }
+        //         }
+        //     }
+
+        //     let result = bucket.get_mut(&(label.coverset.len as SIZE));
+
+        //     if let Some(label_ids) = result {
+        //         let len_before = label_ids.len();
+        //         label_ids.retain(|id| {
+        //             // Remove dominated labels
+        //             !label.dominates(&self.labels[*id], DominanceMode::RC)
+        //         });
+        //         let len_after = label_ids.len();
+        //         self.cut_out += len_before - len_after;
+        //         self.better += 1;
+        //         label_ids.push(label.id);
+        //     }
+        //     else {
+        //         // This cover set has not been found before;
+        //         bucket.insert(label.coverset.covered, vec![label.id]);
+        //     }
+        // }
         // We care about the best label for each node, covered set
         else if phase == LPSolvePhase::VehicleCover {
             let label_ids = bucket.get_mut(&label.coverset.covered);
@@ -172,37 +224,8 @@ impl VisitedData {
         }
 
         else if phase == LPSolvePhase::CostCover {
-            // We care about the best label for each node, cover
-            // Labels can be dominated by smaller coversets with better reduced costs
-            // let mut is_dominated: bool = false;
-            // for prev_label_ids in bucket.iter_mut() {
-            //     let prev_cover_set = &self.labels[prev_label_ids[0]].coverset;
-            //     if prev_cover_set.visits_leq_than(&label.coverset) {
-            //         // We can only be dominated if the previous label vists less than or equal to the new label
-            //         for id in prev_label_ids.iter() {
-            //             if self.labels[*id].dominates(&label, DominanceMode::DurRC) {
-            //                 self.cut_in += 1;
-            //                 is_dominated = true;
-            //                 break; // If the new label is dominated by any of the previous labels, it's not an improvement
-            //             }
-            //         }
-            //     }
-            //     // else {
-            //     //     // We can only dominate if the new label visits greater than or equal to the previous label
-            //     //     // This is the greater than case
-            //     //     prev_label_ids.retain(|id| {
-            //     //         // Remove dominated labels
-            //     //         !label.dominates(&self.labels[*id], DominanceMode::DurRC)
-            //     //     });
-            //     // }
-            // }
-            // // bucket.retain(|l| !l.is_empty());
-            // if is_dominated {
-            //     return false; // If the new label is dominated by any of the previous labels, it's not an improvement
-            // }
-
             // If we reach here, the label is an improvement
-            let result = bucket.get_mut(&label.coverset.covered);
+            let result = bucket.get(&label.coverset.covered);
 
             if let Some(label_ids) = result {
                 for id in label_ids.iter() {
@@ -211,6 +234,28 @@ impl VisitedData {
                         return false; // If the new label is dominated by any of the previous labels, it's not an improvement
                     }
                 }
+
+                for (request_id, request_amount) in label.coverset.to_vec().iter().enumerate() {
+                    if *request_amount == 0 {
+                        continue;
+                    }
+                    let mut coverset: CoverSet = label.coverset;
+                    coverset.uncover(request_id).unwrap();
+                    let result = bucket.get(&coverset.covered);
+                    if let Some(label_ids) = result {
+                        for id in label_ids.iter() {
+                            if self.labels[*id].dominates(&label, DominanceMode::DurRC) {
+                                self.cut_in += 1;
+                                return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+                            }
+                        }
+                    }
+                }
+            }
+
+            let result = bucket.get_mut(&label.coverset.covered);
+
+            if let Some(label_ids) = result {
                 let len_before = label_ids.len();
                 label_ids.retain(|id| {
                     // Remove dominated labels
@@ -242,6 +287,10 @@ impl VisitedData {
             vec![]
         }
     }
+
+    fn get_finished_labels(&self) -> Vec<Label> {
+        self.depot_labels.iter().map(|id| self.labels[*id]).collect()
+    }
     
     fn print_visited_info(&self) {
         println!("Visited info:");
@@ -256,260 +305,112 @@ impl VisitedData {
     }
 }
 
-struct PriorityStructure {
-    pub queue: BinaryHeap<Label>,
-    pub visited: VisitedData, // Label ids
-    pub mode: LPSolvePhase,
-    pub finished_labels: VisitedData, // Finished labels for each node
-}
-
-impl PriorityStructure {
-    fn new(mode: LPSolvePhase, num_nodes: usize) -> Self {
-        PriorityStructure {
-            queue: BinaryHeap::new(),
-            visited: VisitedData::new(num_nodes),
-            mode,
-            finished_labels: VisitedData::new(num_nodes), // Finished labels for each node
-        }
-    }
-
-    fn add_label(&mut self, node_id: usize, reduced_cost: f64, duration: usize, predecessor: usize, cost: usize, coverset: CoverSet) {  
-        let label = Label::new(self.visited.num_labels(), reduced_cost, duration, predecessor, cost, coverset, node_id);
-        self.push(label);
-    }
-
-    fn add_finished_label(&mut self, label: Label) {
-        // for prev_label in self.finished_labels[label.node_id].iter() {
-        //     if prev_label.dominates(&label, DominanceMode::DurRCCover) {
-        //         return;
-        //     }
-        // }
-        // self.finished_labels[label.node_id].push(label); // If the label is for the depot, add it to the depot bucket
-        self.finished_labels.add_with_dominance_mode(label, DominanceMode::DurRC);
-    }
-
-    fn push(&mut self, label: Label) {
-        if label.node_id == 0 {
-            self.add_finished_label(label); // If the label is for the depot, add it to the depot bucket
-        } else {
-            if self.visited.add_if_improvement(label, self.mode) {
-                self.queue.push(label); // Add the label to the priority queue
-            }
-        }
-    }
-
-    fn pop(&mut self, iter: usize) -> Option<Label> {
-        let pop_val = self.queue.pop();
-        
-        if let Some(ref label) = pop_val {
-            for candidate_best_label_id in self.visited.get_label_ids_by_node_covered(label.node_id, &label.coverset).iter() {
-                if *candidate_best_label_id == label.id {
-                    return pop_val;
-                }
-            }
-            self.visited.cut_out += 1;
-            return self.pop(iter+1);
-        }
-        None
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Label {
-    id: usize,
-    pub reduced_cost: f64,
-    duration: usize,
-    predecessor: usize,
-    pub cost: usize,
-    pub coverset: CoverSet,
-    pub node_id: usize,
-}
-
-impl Eq for Label {}
-
-impl Ord for Label {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.duration.cmp(&self.duration)
-    }
-}
-
-impl PartialOrd for Label {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Label {
-    fn new(id: usize, reduced_cost: f64, duration: usize, predecessor: usize, cost: usize, coverset: CoverSet, node_id: usize,) -> Self {    
-        Label {
-            id,
-            reduced_cost,
-            duration,
-            predecessor,
-            cost,
-            coverset,
-            node_id,
-        }
-    }
-
-    fn dominates(&self, other: &Label, mode: DominanceMode) -> bool {
-        match mode {
-            DominanceMode::RC => {
-                self.reduced_cost - other.reduced_cost < 1e-6
-            },
-            DominanceMode::DurRC => {
-                self.reduced_cost - other.reduced_cost < 1e-6 && self.duration <= other.duration
-            },
-            DominanceMode::DurRCCover => {
-                self.reduced_cost - other.reduced_cost < 1e-6 && self.duration <= other.duration && self.coverset.visits_leq_than(&other.coverset)
-            },
-            DominanceMode::Dur => {
-                self.duration <= other.duration
-            },
-        }
-    }
-
-    fn visits_less_eq_than(&self, other: &Label) -> bool {
-        self.coverset.visits_leq_than(&other.coverset)
-    }
-}
-
-impl fmt::Display for Label {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "rc: {:.2}, d: {}, covered: {:?}", 
-            self.reduced_cost, self.duration, self.coverset)
-    }
-}
 pub trait Pricer {
-    fn solve_pricing_problem(&mut self, k: usize, verbose: bool) -> Vec<Label>;
+    fn solve_pricing_problem(&mut self, verbose: bool) -> Vec<Vec<Label>>;
 }
 
-pub struct QueuePricer<'a> {
-    priority_queue: PriorityStructure,
-    forward_queue: PriorityStructure,
-    backward_queue: PriorityStructure,
-    nodes: &'a NodeContainer,
-    arcs: &'a ArcContainer,
+
+
+struct BucketGraph {
+    buckets: Vec<Vec<Vec<usize>>>,
+    bucket_length: usize,
+    finished_bucket: Vec<usize>,    
+    current_bucket: usize,
+    current_node: usize,
+}
+
+impl BucketGraph {
+    pub fn new(time_limit: usize, smallest_arc_duration: usize, num_nodes: usize) -> Self {
+        let num_buckets = time_limit / smallest_arc_duration + 1;
+        let buckets: Vec<Vec<Vec<usize>>> = vec![vec![Vec::new(); num_nodes]; num_buckets];
+        let finished_bucket = vec![];
+        BucketGraph { buckets, bucket_length: smallest_arc_duration, finished_bucket, current_bucket: 0, current_node: 0 }
+    }
+
+    fn get_bucket_by_duration(&mut self, node_id: usize, time: usize) -> &mut Vec<usize> {
+        let bucket_index = time / self.bucket_length;
+        assert!(bucket_index < self.buckets.len(), "Bucket index out of bounds: {}, time: {}", bucket_index, time);
+        assert!(node_id < self.buckets[0].len(), "Node ID out of bounds: {}", node_id);
+        &mut self.buckets[bucket_index][node_id]
+    }
+
+    fn push(&mut self, label: Label, max: usize) {  
+        if label.id >= max {
+            println!("Label: {}", label);
+            panic!("Label ID {} exceeds maximum allowed {}", label.id, max);
+        }
+        if label.node_id == 0 {
+            if label.reduced_cost <= -EPS {
+                self.finished_bucket.push(label.id);
+            }
+        } else {
+            self.get_bucket_by_duration(label.node_id, label.duration).push(label.id);
+        }
+    }
+
+    fn get_next_bucket(&mut self) -> Option<&mut Vec<usize>> {
+        if self.current_node < self.buckets[self.current_bucket].len() - 1 {
+            self.current_node += 1;
+        } else {
+            self.current_node = 0;
+            self.current_bucket += 1;
+        }
+        if self.current_bucket < self.buckets.len() {
+            Some(&mut self.buckets[self.current_bucket][self.current_node])
+        } else {
+            // Reset the iterator
+            self.reset();
+            None
+        }
+    }
+
+    fn reset(&mut self) {
+        self.current_bucket = 0;
+        self.current_node = 0;
+    }
+}
+
+impl Display for BucketGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for bucket in &self.buckets {
+            for node in bucket {
+                write!(f, "{:?} ", node.len())?;
+            }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+}
+
+
+pub struct BucketPricer<'a> {
+    graph: BucketGraph,
+    cover_rc: Vec<f64>,
+    vehicle_rc: Option<f64>,
+    phase: LPSolvePhase,
     data: &'a SPDPData,
-    cover_rc: &'a Vec<f64>,
-    vehicle_rc: &'a Option<f64>,
+    arcs: &'a ArcContainer,
+    nodes: &'a NodeContainer,
+    visited: VisitedData,
 }
 
-impl<'a> QueuePricer<'a>  {
-    pub fn new(nodes: &'a NodeContainer, arcs: &'a ArcContainer, data: &'a SPDPData, cover_rc: &'a Vec<f64>, vehicle_rc: &'a Option<f64>, mode: LPSolvePhase) -> Self {
-        let priority_queue = PriorityStructure::new(mode, nodes.nodes.len());
-
-        QueuePricer {
-            priority_queue,
-            forward_queue: PriorityStructure::new(mode, nodes.nodes.len()),
-            backward_queue: PriorityStructure::new(mode, nodes.nodes.len()),
-            nodes,
-            arcs,
-            data,
+impl<'a> BucketPricer<'a> {
+    pub fn new(data: &'a SPDPData, nodes: &'a NodeContainer, arcs: &'a ArcContainer, cover_rc: Vec<f64>, vehicle_rc: Option<f64>, phase: LPSolvePhase) -> Self {
+        let graph = BucketGraph::new(data.t_limit, arcs.min_fragment_length, nodes.nodes.len());
+        let visited = VisitedData::new(nodes.nodes.len());
+        BucketPricer {
+            graph,
             cover_rc,
             vehicle_rc,
+            phase,
+            data,
+            arcs,
+            nodes,
+            visited,
         }
     }
 
-    fn extend_label(&mut self, label: &Label, arc: &Arc) {     
-        let next_node_id = arc.end.id;
-        let new_duration = label.duration + arc.time;
-        let new_cost = label.cost + arc.cost;
-
-        let serviced = match arc.done.len() {
-            0 => vec![],
-            1 => vec![arc.done.left()],
-            _ => vec![arc.done.left(), arc.done.right()],
-        };
-
-        let mut new_covered = label.coverset;
-        let mut new_reduced_cost = label.reduced_cost;
-
-        for request_id in serviced.iter() {
-            new_covered.cover(*request_id);
-            if !new_covered.is_valid() {
-                return; // Skip if the request is already serviced
-            }
-            new_reduced_cost -= self.cover_rc[*request_id];
-        }
-
-        new_reduced_cost += if self.vehicle_rc.is_some() {arc.cost as f64} else {0.0};
-
-        if new_duration > self.data.t_limit {
-            return; // Skip if the new duration exceeds the time limit
-        }
-        
-        self.priority_queue.add_label(next_node_id, new_reduced_cost, new_duration, label.id, new_cost, new_covered);
-    }
-
-    fn extend_label_forward(&mut self, label: &Label, arc: &Arc) {     
-        let next_node_id = arc.end.id;
-        let new_duration = label.duration + arc.time;
-        let new_cost = label.cost + arc.cost;
-
-        let serviced = match arc.done.len() {
-            0 => vec![],
-            1 => vec![arc.done.left()],
-            _ => vec![arc.done.left(), arc.done.right()],
-        };
-
-        let mut new_covered = label.coverset;
-        let mut new_reduced_cost = label.reduced_cost;
-
-        for request_id in serviced.iter() {
-            new_covered.cover(*request_id);
-            if !new_covered.is_valid() {
-                return; // Skip if the request is already serviced
-            }
-            new_reduced_cost -= self.cover_rc[*request_id];
-        }
-
-        new_reduced_cost += if self.vehicle_rc.is_some() {arc.cost as f64} else {0.0};
-
-        if new_duration > self.data.t_limit {
-            return; // Skip if the new duration exceeds the time limit
-        }
-
-        self.forward_queue.add_label(next_node_id, new_reduced_cost, new_duration, label.id, new_cost, new_covered);
-    }
-
-    fn extend_label_backward(&mut self, label: &Label, arc: &Arc) {    
-        let next_node_id = arc.start.id;
-        let new_duration = label.duration + arc.time;
-        let new_cost = label.cost + arc.cost;
-
-        let serviced = match arc.done.len() {
-            0 => vec![],
-            1 => vec![arc.done.left()],
-            _ => vec![arc.done.left(), arc.done.right()],
-        };
-
-        let mut new_covered = label.coverset;
-        let mut new_reduced_cost = label.reduced_cost;
-
-        for request_id in serviced.iter() {
-            new_covered.cover(*request_id);
-            if !new_covered.is_valid() {
-                return; // Skip if the request is already serviced
-            }
-            new_reduced_cost -= self.cover_rc[*request_id];
-        }
-
-        new_reduced_cost += if self.vehicle_rc.is_some() {arc.cost as f64} else {0.0};
-
-        if new_duration > self.data.t_limit {
-            return; // Skip if the new duration exceeds the time limit
-        }
-
-        if new_duration > self.data.t_limit {
-            return; // Skip if the new duration exceeds the time limit
-        }
-        
-        self.backward_queue.add_label(next_node_id, new_reduced_cost, new_duration, label.id, new_cost, new_covered);
-    }
-
-    fn forward_pass(&mut self) { 
-        // Create the initial labels
+    fn initialise_forward_labels(&mut self) {
         for arc in self.arcs.arcs_from.get(&self.nodes.depot).unwrap() {
             let serviced = match arc.done.len() {
                 0 => vec![],
@@ -525,74 +426,14 @@ impl<'a> QueuePricer<'a>  {
                 else {
                     arc.cost as f64 - self.vehicle_rc.unwrap()
                 };
-            self.priority_queue.add_label(arc.end.id, new_reduced_cost, arc.time, 0, arc.cost, coverset);
-        }
-
-        while let Some(curr) = self.priority_queue.pop(0) {
-            let raw_ptr: *mut QueuePricer = self;  
-            unsafe {
-                if let Some(pricer_ref) = raw_ptr.as_mut() {
-                    let forward_arcs = self.arcs.arcs_from.get(&self.nodes.nodes[curr.node_id]).unwrap();
-                    for arc in forward_arcs {
-                        pricer_ref.extend_label(&curr, arc);
-                    }
-                }
+            let new_label = Label::new(self.visited.num_labels(), new_reduced_cost, arc.time, 0, arc.cost, coverset, arc.end.id);
+            if self.visited.add_if_improvement(new_label, self.phase) {
+                self.graph.push(new_label, self.visited.labels.len());
             }
         }
-        self.priority_queue.finished_labels.get_label_ids_by_node(0).sort_by(|a, b| { 
-            self.priority_queue.finished_labels.labels[*a].reduced_cost.partial_cmp(&self.priority_queue.finished_labels.labels[*b].reduced_cost).unwrap()
-        });
     }
 
-    fn forward_backward_pass(&mut self, k: usize, verbose: bool) -> Vec<Label> {
-        // Create the initial labels
-        for arc in self.arcs.arcs_from.get(&self.nodes.depot).unwrap() {
-            let serviced = match arc.done.len() {
-                0 => vec![],
-                1 => vec![arc.done.left()],
-                _ => vec![arc.done.left(), arc.done.right()],
-            };
-            assert!(serviced.len() == 0);
-            let coverset = CoverSet::new(get_manager());
-
-            assert!(arc.time == 0);
-            let new_reduced_cost = if self.vehicle_rc.is_none() {
-                    1.0
-                } 
-                else {
-                    arc.cost as f64 - self.vehicle_rc.unwrap()
-                };
-            if !arc.end.is_depot() {
-                self.forward_queue.add_label(arc.end.id, new_reduced_cost, arc.time, 0, arc.cost, coverset);
-            }
-        }
-
-        // Forward pass to halfway point
-        while let Some(curr) = self.forward_queue.pop(0) {
-            if curr.duration > self.data.t_limit / 2 {
-                // Reached the halfway point
-                self.forward_queue.add_finished_label(curr);
-                continue;
-            }
-            let raw_ptr: *mut QueuePricer = self;  
-            unsafe {
-                if let Some(pricer_ref) = raw_ptr.as_mut() {
-                    let forward_arcs = self.arcs.arcs_from.get(&self.nodes.nodes[curr.node_id]).unwrap();
-                    for arc in forward_arcs {
-                        pricer_ref.extend_label_forward(&curr, arc);
-                    }
-                }
-            }
-            self.forward_queue.add_finished_label(curr);
-        }
-
-        if verbose {
-            println!("Forward pass finished");
-            self.forward_queue.visited.print_visited_info();
-        }
-
-        // Backward pass
-
+    fn initialise_backward_labels(&mut self) {
         for arc in self.arcs.arcs_to.get(&self.nodes.depot).unwrap() {
             let serviced = match arc.done.len() {
                 0 => vec![],
@@ -600,57 +441,192 @@ impl<'a> QueuePricer<'a>  {
                 _ => vec![arc.done.left(), arc.done.right()],
             };
             let mut coverset = CoverSet::new(get_manager());
-            for idx in serviced.iter() {
-                coverset.cover(*idx);
-            }
-            let new_reduced_cost = if self.vehicle_rc.is_none() {
+            let mut new_reduced_cost = if self.vehicle_rc.is_none() {
                     0.0
-                } 
-                else {
+                } else {
                     arc.cost as f64
-                } - serviced.iter().map(|idx| self.cover_rc[*idx]).sum::<f64>();
-            if !arc.start.is_depot() {
-                self.backward_queue.add_label(arc.start.id, new_reduced_cost, arc.time, 0, arc.cost, coverset);
+                };
+            for r_id in serviced.iter() {
+                match coverset.cover(*r_id) {
+                    Ok(_) => {},
+                    Err(_) => break, // Skip if the request is already serviced
+                }
+                new_reduced_cost -= self.cover_rc[*r_id];
             }
+            // println!("Initialising backward label with rc {:?}", new_reduced_cost);
+
+            let new_label = Label::new(self.visited.num_labels(), new_reduced_cost, arc.time, 0, arc.cost, coverset, arc.start.id);
+            if self.visited.add_if_improvement(new_label, self.phase) {
+                self.graph.push(new_label, self.visited.labels.len());
+            }
+        }
+    }
+
+    /// Extends a label by a given arc, creating a new label if the extension is valid.
+    fn calculate_next_label(&self, label: &Label, arc: &Arc) -> Option<Label> {
+        let mut next_node_id = arc.end.id;
+        if next_node_id == label.node_id {
+            next_node_id = arc.start.id; // Make sure we go in the correct direction
         }
 
-        while let Some(curr) = self.backward_queue.pop(0) {
-            let raw_ptr: *mut QueuePricer = self;  
-            unsafe {
-                if let Some(pricer_ref) = raw_ptr.as_mut() {
-                    let backward_arcs = self.arcs.arcs_to.get(&self.nodes.nodes[curr.node_id]).unwrap();
-                    for arc in backward_arcs {
-                        if curr.duration + arc.time > self.data.t_limit / 2 {
-                            // Reached the halfway point
-                            self.backward_queue.add_finished_label(curr);
-                            continue;
-                        }
-                        pricer_ref.extend_label_backward(&curr, arc);
-                    }
+        let new_duration = label.duration + arc.time;
+
+        if new_duration > self.data.t_limit {
+            return None; // Skip if the new duration exceeds the time limit
+        }
+
+        let new_cost = label.cost + arc.cost;
+
+        let serviced = match arc.done.len() {
+            0 => vec![],
+            1 => vec![arc.done.left()],
+            _ => vec![arc.done.left(), arc.done.right()],
+        };
+
+        let mut new_covered = label.coverset;
+        let mut new_reduced_cost = label.reduced_cost;
+
+        for request_id in serviced.iter() {
+            let reduction = self.cover_rc[*request_id];
+            // if reduction < EPS {
+            //     return None; // Skip if the request does not contribute to the reduced cost
+            // }
+            match new_covered.cover(*request_id) {
+                Ok(_) => {},
+                Err(_) => {return None;}, // Skip if the request is already serviced enough
+            }
+            new_reduced_cost -= reduction;
+        }
+
+        new_reduced_cost += if self.vehicle_rc.is_some() {arc.cost as f64} else {0.0};
+
+        Some(Label::new(
+            self.visited.num_labels(),
+            new_reduced_cost,
+            new_duration,
+            label.id,
+            new_cost,
+            new_covered,
+            next_node_id,
+        ))
+    }
+
+    /// Extends a label by a given arc, creating a new label if the extension is valid.
+    /// Set time limit to be the route time limit in the full forward modes, and half the timelimit for half passes.
+    fn extend_label(&mut self, label: &Label, arc: &Arc, backward_pass_limit: usize) {   
+        // Used for the half forward pass, dont extend labels past the time limit
+        if let Some(next_label) = self.calculate_next_label(label, arc) {
+            // Used for half backward pass, dont consider labels that exceed the backward pass limit
+            if next_label.duration > backward_pass_limit {
+                return;    
+            }
+            if self.visited.add_if_improvement(next_label, self.phase) {
+                self.graph.push(next_label, self.visited.labels.len());
+            }
+        } 
+        // println!("Skipping label extension: {}", label.id);
+    }
+    
+    fn forward_pass(&mut self, time_limit: usize) {
+        loop {
+            let result = self.graph.get_next_bucket();
+            if result.is_none() {
+                break; // No more buckets to process
+            }
+            let bucket = std::mem::take(result.unwrap());
+            for &label_id in bucket.iter() {
+                let label = self.visited.labels[label_id];
+                // println!("Processing label: {}", label.reduced_cost);
+                if !self.visited.contains_label(&label, self.phase) {
+                    // If the label is not in the visited set, it has been pruned
+                    // println!("Label not visited, skipping");
+                    continue;
+                }
+
+                if label.duration > time_limit {
+                    // Reached the point where we should stop
+                    self.graph.reset();
+                    return; // Stop processing further labels
+                }
+                let node = &self.nodes.nodes[label.node_id];
+                let forward_arcs = self.arcs.arcs_from.get(node).unwrap();
+                for arc in forward_arcs {
+                    self.extend_label(&label, arc, self.data.t_limit);
                 }
             }
-            self.backward_queue.add_finished_label(curr);
         }
+    }
+
+    fn backward_pass(&mut self, time_limit: usize) {
+        loop {
+            let result = self.graph.get_next_bucket();
+            if result.is_none() {
+                break; // No more buckets to process
+            }
+            let bucket = std::mem::take(result.unwrap());
+            for &label_id in bucket.iter() {
+                let label = self.visited.labels[label_id];
+                if !self.visited.contains_label(&label, self.phase) {
+                    // If the label is not in the visited set, it has been pruned
+                    continue;
+                }
+                let node = &self.nodes.nodes[label.node_id];
+                let backward_arcs = self.arcs.arcs_to.get(node).unwrap();
+                for arc in backward_arcs {
+                    self.extend_label(&label, arc, time_limit);
+                }
+            }
+        }
+    }
+
+    fn forward_backward_pass(&mut self, k: usize, verbose: bool) -> Vec<Vec<Label>> {
+        // Create the initial labels
+        self.initialise_forward_labels();
+        self.forward_pass((self.data.t_limit as f64 * FORWARD_BACKWARD_PASS_MARK) as usize);
+
+        if verbose {
+            println!("Forward pass finished");
+            self.visited.print_visited_info();
+        }
+
+        let forward_pass_info = std::mem::replace(&mut self.visited, VisitedData::new(self.nodes.nodes.len()));
+        self.graph = BucketGraph::new(self.data.t_limit, self.arcs.min_fragment_length, self.nodes.nodes.len());
+
+        // Backward pass
+        self.initialise_backward_labels();
+        self.backward_pass((self.data.t_limit as f64 * (1.0-FORWARD_BACKWARD_PASS_MARK)) as usize);
 
         if verbose {
             println!("Backward pass finished");
-            self.backward_queue.visited.print_visited_info();
+            self.visited.print_visited_info();
         }
 
         // Combine forward and backward labels
-        let forward_labels = &self.forward_queue.finished_labels;
-        let backward_labels = &self.backward_queue.finished_labels;
-        let mut candidate_labels = Vec::new();
+        let mut candidate_labels: Vec<Vec<Label>> = vec![Vec::new(); self.nodes.nodes.len()];
+        let depot_id = self.nodes.depot.id;
 
-        let mut worst_rc = -1e-6;
-        let mut worst_idx = 0;
+        for label_id in forward_pass_info.get_label_ids_by_node(depot_id) {
+            let forward_label = &forward_pass_info.labels[label_id];
+            if forward_label.reduced_cost < -EPS {
+                candidate_labels[depot_id].push(*forward_label);
+            }
+        }
 
-        for node_id in 0..self.nodes.nodes.len() {
-            let mut forward_bucket = forward_labels.get_label_ids_by_node(node_id).iter().map(|id| &forward_labels.labels[*id]).collect::<Vec<_>>();
-            let mut backward_bucket = backward_labels.get_label_ids_by_node(node_id).iter().map(|id| &backward_labels.labels[*id]).collect::<Vec<_>>();
-            // println!("Combining forward and backward labels at node {}", node_id);
-            // println!("Forward labels: {}", forward_bucket.len());
-            // println!("Backward labels: {}", backward_bucket.len());
+        
+        if candidate_labels[depot_id].len() > k {
+            candidate_labels[depot_id].sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
+            candidate_labels[depot_id].truncate(k); // Keep only the best k labels
+        }
+        else if candidate_labels[depot_id].is_empty() {
+            println!("No complete routes in forward pass");
+        }
+
+        for node_id in 1..self.nodes.nodes.len() {
+            let mut worst_rc = -EPS;
+            let mut worst_idx = 0;
+
+            let mut forward_bucket = forward_pass_info.get_label_ids_by_node(node_id).iter().map(|id| &forward_pass_info.labels[*id]).collect::<Vec<_>>();
+            let mut backward_bucket = self.visited.get_label_ids_by_node(node_id).iter().map(|id| &self.visited.labels[*id]).collect::<Vec<_>>();
 
             forward_bucket.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
             backward_bucket.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
@@ -675,19 +651,19 @@ impl<'a> QueuePricer<'a>  {
                                 0,
                             );
 
-                            if !candidate_labels.iter().any(|l: &Label| l.dominates(&candidate_label, DominanceMode::DurRCCover)) {
-                                if candidate_labels.len() < k {
-                                    candidate_labels.push(candidate_label);
+                            if !candidate_labels[node_id].iter().any(|l: &Label| l.dominates(&candidate_label, DominanceMode::DurRCCover)) {
+                                if candidate_labels[node_id].len() < k {
+                                    candidate_labels[node_id].push(candidate_label);
                                     if candidate_label.reduced_cost > worst_rc {
                                         worst_rc = candidate_label.reduced_cost;
-                                        worst_idx = candidate_labels.len() - 1;
+                                        worst_idx = candidate_labels[node_id].len() - 1;
                                     }
                                 } else {
-                                    candidate_labels[worst_idx] = candidate_label; // Replace the worst label with the new one
+                                    candidate_labels[node_id][worst_idx] = candidate_label; // Replace the worst label with the new one
                                     let mut idx = 0;
-                                    let mut worst_cost = candidate_labels[0].reduced_cost;
+                                    let mut worst_cost = candidate_labels[node_id][0].reduced_cost;
                                     // Find the index of the worst label
-                                    for (i, label) in candidate_labels.iter().enumerate() {
+                                    for (i, label) in candidate_labels[node_id].iter().enumerate() {
                                         if label.reduced_cost > worst_cost {
                                             idx = i;
                                             worst_cost = label.reduced_cost;
@@ -702,35 +678,464 @@ impl<'a> QueuePricer<'a>  {
                 }
             }
         }
-        // Sort the candidate labels by reduced cost
+        candidate_labels
+    }
+
+    fn full_forward_pass(&mut self, k: usize, verbose: bool) -> Vec<Label> {
+        // Create the initial labels
+        self.initialise_forward_labels();
+        self.forward_pass(self.data.t_limit);
+
+        let mut candidate_labels = self.visited.get_finished_labels()
+            .iter()
+            .filter_map(|label| {
+                if label.reduced_cost < -EPS {
+                    Some(*label)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
         candidate_labels.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
+
+        if verbose {
+            println!("Full forward pass finished");
+            self.visited.print_visited_info();
+        }
+
+        candidate_labels[0..min(k, candidate_labels.len())].to_vec()
+    }
+}
+
+impl Pricer for BucketPricer<'_> {  
+    fn solve_pricing_problem(&mut self, verbose: bool) -> Vec<Vec<Label>> {
+        init_manager(self.data); // Cursed but necessary? It is what it is
+
+        let candidate_labels = match self.phase {
+            LPSolvePhase::VehicleNoCover | LPSolvePhase::CostNoCover => {
+                self.forward_backward_pass(NUM_ROUTES_PER_NODE_CALCULATED, verbose)
+            }, 
+            LPSolvePhase::VehicleCover | LPSolvePhase::CostCover => {
+                self.forward_backward_pass(NUM_ROUTES_PER_NODE_CALCULATED, verbose)
+            },
+        };
 
         candidate_labels
     }
 }
 
-impl Pricer for QueuePricer<'_> {
-    fn solve_pricing_problem(&mut self, k: usize, verbose: bool) -> Vec<Label> {
-        // self.forward_pass();
-        // let depot_labels = &self.priority_queue.finished_labels[0];
 
-        init_manager(self.data);
+// struct PriorityStructure {
+//     pub queue: BinaryHeap<Label>,
+//     pub visited: VisitedData, // Label ids
+//     pub mode: LPSolvePhase,
+//     pub finished_labels: VisitedData, // Finished labels for each node
+// }
 
-        let depot_labels = self.forward_backward_pass(k, verbose);
+// impl PriorityStructure {
+//     fn new(mode: LPSolvePhase, num_nodes: usize) -> Self {
+//         PriorityStructure {
+//             queue: BinaryHeap::new(),
+//             visited: VisitedData::new(num_nodes),
+//             mode,
+//             finished_labels: VisitedData::new(num_nodes), // Finished labels for each node
+//         }
+//     }
 
-        let mut labels: Vec<Label> = Vec::new();
+//     fn add_label(&mut self, node_id: usize, reduced_cost: f64, duration: usize, predecessor: usize, cost: usize, coverset: CoverSet) {  
+//         let label = Label::new(self.visited.num_labels(), reduced_cost, duration, predecessor, cost, coverset, node_id);
+//         self.push(label);
+//     }
 
-        for idx in 0..min(k, depot_labels.len()) {
-            let label = &depot_labels[idx];
-            if label.reduced_cost < -1e-6 {
-                labels.retain(|l| !label.dominates(l, DominanceMode::DurRCCover));
-                labels.push(*label);
-            }
-        }
+//     fn add_finished_label(&mut self, label: Label) {
+//         // for prev_label in self.finished_labels[label.node_id].iter() {
+//         //     if prev_label.dominates(&label, DominanceMode::DurRCCover) {
+//         //         return;
+//         //     }
+//         // }
+//         // self.finished_labels[label.node_id].push(label); // If the label is for the depot, add it to the depot bucket
+//         self.finished_labels.add_with_dominance_mode(label, DominanceMode::DurRC);
+//     }
 
-        labels
-    }
-}
+//     fn push(&mut self, label: Label) {
+//         if label.node_id == 0 {
+//             self.add_finished_label(label); // If the label is for the depot, add it to the depot bucket
+//         } else {
+//             if self.visited.add_if_improvement(label, self.mode) {
+//                 self.queue.push(label); // Add the label to the priority queue
+//             }
+//         }
+//     }
+
+//     fn pop(&mut self, iter: usize) -> Option<Label> {
+//         let pop_val = self.queue.pop();
+        
+//         if let Some(ref label) = pop_val {
+//             for candidate_best_label_id in self.visited.get_label_ids_by_node_covered(label.node_id, &label.coverset).iter() {
+//                 if *candidate_best_label_id == label.id {
+//                     return pop_val;
+//                 }
+//             }
+//             self.visited.cut_out += 1;
+//             return self.pop(iter+1);
+//         }
+//         None
+//     }
+// }
+
+
+
+// pub struct QueuePricer<'a> {
+//     priority_queue: PriorityStructure,
+//     forward_queue: PriorityStructure,
+//     backward_queue: PriorityStructure,
+//     nodes: &'a NodeContainer,
+//     arcs: &'a ArcContainer,
+//     data: &'a SPDPData,
+//     cover_rc: Vec<f64>,
+//     vehicle_rc: Option<f64>,
+// }
+
+// impl<'a> QueuePricer<'a>  {
+//     pub fn new(data: &'a SPDPData, nodes: &'a NodeContainer, arcs: &'a ArcContainer, cover_rc: Vec<f64>, vehicle_rc: Option<f64>, phase: LPSolvePhase) -> Self {
+//         let priority_queue = PriorityStructure::new(phase, nodes.nodes.len());
+
+//         QueuePricer {
+//             priority_queue,
+//             forward_queue: PriorityStructure::new(phase, nodes.nodes.len()),
+//             backward_queue: PriorityStructure::new(phase, nodes.nodes.len()),
+//             nodes,
+//             arcs,
+//             data,
+//             cover_rc,
+//             vehicle_rc,
+//         }
+//     }
+
+//     fn extend_label(&mut self, label: &Label, arc: &Arc) {     
+//         let next_node_id = arc.end.id;
+//         let new_duration = label.duration + arc.time;
+//         let new_cost = label.cost + arc.cost;
+
+//         let serviced = match arc.done.len() {
+//             0 => vec![],
+//             1 => vec![arc.done.left()],
+//             _ => vec![arc.done.left(), arc.done.right()],
+//         };
+
+//         let mut new_covered = label.coverset;
+//         let mut new_reduced_cost = label.reduced_cost;
+
+//         for request_id in serviced.iter() {
+//             match new_covered.cover(*request_id) {
+//                 Ok(_) => {},
+//                 Err(_) => return, // Skip if the request is already serviced
+//             }
+//             new_reduced_cost -= self.cover_rc[*request_id];
+//         }
+
+//         new_reduced_cost += if self.vehicle_rc.is_some() {arc.cost as f64} else {0.0};
+
+//         if new_duration > self.data.t_limit {
+//             return; // Skip if the new duration exceeds the time limit
+//         }
+        
+//         self.priority_queue.add_label(next_node_id, new_reduced_cost, new_duration, label.id, new_cost, new_covered);
+//     }
+
+//     fn extend_label_forward(&mut self, label: &Label, arc: &Arc) {     
+//         let next_node_id = arc.end.id;
+//         let new_duration = label.duration + arc.time;
+//         let new_cost = label.cost + arc.cost;
+
+//         let serviced = match arc.done.len() {
+//             0 => vec![],
+//             1 => vec![arc.done.left()],
+//             _ => vec![arc.done.left(), arc.done.right()],
+//         };
+
+//         let mut new_covered = label.coverset;
+//         let mut new_reduced_cost = label.reduced_cost;
+
+//         for request_id in serviced.iter() {
+//             match new_covered.cover(*request_id) {
+//                 Ok(_) => {},
+//                 Err(_) => return, // Skip if the request is already serviced
+//             }
+//             new_reduced_cost -= self.cover_rc[*request_id];
+//         }
+
+//         new_reduced_cost += if self.vehicle_rc.is_some() {arc.cost as f64} else {0.0};
+
+//         if new_duration > self.data.t_limit {
+//             return; // Skip if the new duration exceeds the time limit
+//         }
+
+//         self.forward_queue.add_label(next_node_id, new_reduced_cost, new_duration, label.id, new_cost, new_covered);
+//     }
+
+//     fn extend_label_backward(&mut self, label: &Label, arc: &Arc) {    
+//         let next_node_id = arc.start.id;
+//         let new_duration = label.duration + arc.time;
+//         let new_cost = label.cost + arc.cost;
+
+//         let serviced = match arc.done.len() {
+//             0 => vec![],
+//             1 => vec![arc.done.left()],
+//             _ => vec![arc.done.left(), arc.done.right()],
+//         };
+
+//         let mut new_covered = label.coverset;
+//         let mut new_reduced_cost = label.reduced_cost;
+
+//         for request_id in serviced.iter() {
+//             match new_covered.cover(*request_id) {
+//                 Ok(_) => {},
+//                 Err(_) => return, // Skip if the request is already serviced
+//             }
+//             new_reduced_cost -= self.cover_rc[*request_id];
+//         }
+
+//         new_reduced_cost += if self.vehicle_rc.is_some() {arc.cost as f64} else {0.0};
+
+//         if new_duration > self.data.t_limit {
+//             return; // Skip if the new duration exceeds the time limit
+//         }
+
+//         if new_duration > self.data.t_limit {
+//             return; // Skip if the new duration exceeds the time limit
+//         }
+        
+//         self.backward_queue.add_label(next_node_id, new_reduced_cost, new_duration, label.id, new_cost, new_covered);
+//     }
+
+//     fn forward_pass(&mut self) { 
+//         // Create the initial labels
+//         for arc in self.arcs.arcs_from.get(&self.nodes.depot).unwrap() {
+//             let serviced = match arc.done.len() {
+//                 0 => vec![],
+//                 1 => vec![arc.done.left()],
+//                 _ => vec![arc.done.left(), arc.done.right()],
+//             };
+//             assert!(serviced.len() == 0);
+//             let coverset = CoverSet::new(get_manager());
+//             assert!(arc.time == 0);
+//             let new_reduced_cost = if self.vehicle_rc.is_none() {
+//                     1.0
+//                 } 
+//                 else {
+//                     arc.cost as f64 - self.vehicle_rc.unwrap()
+//                 };
+//             self.priority_queue.add_label(arc.end.id, new_reduced_cost, arc.time, 0, arc.cost, coverset);
+//         }
+
+//         while let Some(curr) = self.priority_queue.pop(0) {
+//             let raw_ptr: *mut QueuePricer = self;  
+//             unsafe {
+//                 if let Some(pricer_ref) = raw_ptr.as_mut() {
+//                     let forward_arcs = self.arcs.arcs_from.get(&self.nodes.nodes[curr.node_id]).unwrap();
+//                     for arc in forward_arcs {
+//                         pricer_ref.extend_label(&curr, arc);
+//                     }
+//                 }
+//             }
+//         }
+//         self.priority_queue.finished_labels.get_label_ids_by_node(0).sort_by(|a, b| { 
+//             self.priority_queue.finished_labels.labels[*a].reduced_cost.partial_cmp(&self.priority_queue.finished_labels.labels[*b].reduced_cost).unwrap()
+//         });
+//     }
+
+//     fn forward_backward_pass(&mut self, k: usize, verbose: bool) -> Vec<Label> {
+//         // Create the initial labels
+//         for arc in self.arcs.arcs_from.get(&self.nodes.depot).unwrap() {
+//             let serviced = match arc.done.len() {
+//                 0 => vec![],
+//                 1 => vec![arc.done.left()],
+//                 _ => vec![arc.done.left(), arc.done.right()],
+//             };
+//             assert!(serviced.len() == 0);
+//             let coverset = CoverSet::new(get_manager());
+
+//             assert!(arc.time == 0);
+//             let new_reduced_cost = if self.vehicle_rc.is_none() {
+//                     1.0
+//                 } 
+//                 else {
+//                     arc.cost as f64 - self.vehicle_rc.unwrap()
+//                 };
+//             if !arc.end.is_depot() {
+//                 self.forward_queue.add_label(arc.end.id, new_reduced_cost, arc.time, 0, arc.cost, coverset);
+//             }
+//         }
+
+//         // Forward pass to halfway point
+//         while let Some(curr) = self.forward_queue.pop(0) {
+//             if curr.duration > self.data.t_limit / 2 {
+//                 // Reached the halfway point
+//                 self.forward_queue.add_finished_label(curr);
+//                 continue;
+//             }
+//             let raw_ptr: *mut QueuePricer = self;  
+//             unsafe {
+//                 if let Some(pricer_ref) = raw_ptr.as_mut() {
+//                     let forward_arcs = self.arcs.arcs_from.get(&self.nodes.nodes[curr.node_id]).unwrap();
+//                     for arc in forward_arcs {
+//                         pricer_ref.extend_label_forward(&curr, arc);
+//                     }
+//                 }
+//             }
+//             self.forward_queue.add_finished_label(curr);
+//         }
+
+//         if verbose {
+//             println!("Forward pass finished");
+//             self.forward_queue.visited.print_visited_info();
+//         }
+
+//         // Backward pass
+
+//         for arc in self.arcs.arcs_to.get(&self.nodes.depot).unwrap() {
+//             let serviced = match arc.done.len() {
+//                 0 => vec![],
+//                 1 => vec![arc.done.left()],
+//                 _ => vec![arc.done.left(), arc.done.right()],
+//             };
+//             let mut coverset = CoverSet::new(get_manager());
+//             for idx in serviced.iter() {
+//                 match coverset.cover(*idx) {
+//                     Ok(_) => {},
+//                     Err(_) => continue, // Skip if the request is already serviced
+//                 }
+//             }
+//             let new_reduced_cost = if self.vehicle_rc.is_none() {
+//                     0.0
+//                 } 
+//                 else {
+//                     arc.cost as f64
+//                 } - serviced.iter().map(|idx| self.cover_rc[*idx]).sum::<f64>();
+//             if !arc.start.is_depot() {
+//                 self.backward_queue.add_label(arc.start.id, new_reduced_cost, arc.time, 0, arc.cost, coverset);
+//             }
+//         }
+
+//         while let Some(curr) = self.backward_queue.pop(0) {
+//             let raw_ptr: *mut QueuePricer = self;  
+//             unsafe {
+//                 if let Some(pricer_ref) = raw_ptr.as_mut() {
+//                     let backward_arcs = self.arcs.arcs_to.get(&self.nodes.nodes[curr.node_id]).unwrap();
+//                     for arc in backward_arcs {
+//                         if curr.duration + arc.time > self.data.t_limit / 2 {
+//                             // Reached the halfway point
+//                             self.backward_queue.add_finished_label(curr);
+//                             continue;
+//                         }
+//                         pricer_ref.extend_label_backward(&curr, arc);
+//                     }
+//                 }
+//             }
+//             self.backward_queue.add_finished_label(curr);
+//         }
+
+//         if verbose {
+//             println!("Backward pass finished");
+//             self.backward_queue.visited.print_visited_info();
+//         }
+
+//         // Combine forward and backward labels
+//         let forward_labels = &self.forward_queue.finished_labels;
+//         let backward_labels = &self.backward_queue.finished_labels;
+//         let mut candidate_labels = Vec::new();
+
+//         let mut worst_rc = -EPS;
+//         let mut worst_idx = 0;
+
+//         for node_id in 0..self.nodes.nodes.len() {
+//             let mut forward_bucket = forward_labels.get_label_ids_by_node(node_id).iter().map(|id| &forward_labels.labels[*id]).collect::<Vec<_>>();
+//             let mut backward_bucket = backward_labels.get_label_ids_by_node(node_id).iter().map(|id| &backward_labels.labels[*id]).collect::<Vec<_>>();
+//             // println!("Combining forward and backward labels at node {}", node_id);
+//             // println!("Forward labels: {}", forward_bucket.len());
+//             // println!("Backward labels: {}", backward_bucket.len());
+
+//             forward_bucket.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
+//             backward_bucket.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
+
+//             for forward_label in forward_bucket.iter() {
+//                 for backward_label in backward_bucket.iter() {
+//                     if forward_label.reduced_cost + backward_label.reduced_cost >= worst_rc {
+//                         break; // Skip if the combined reduced cost is not negative
+//                     }
+//                     if forward_label.duration + backward_label.duration <= self.data.t_limit {
+//                         let new_covered = forward_label.coverset.combine(&backward_label.coverset);
+//                         if new_covered.is_ok() {
+//                             // Create a new label combining forward and backward labels
+//                             // Ensure the new label is not dominated by any existing label
+//                             let candidate_label = Label::new(
+//                             0,
+//                                 forward_label.reduced_cost + backward_label.reduced_cost,
+//                                 forward_label.duration + backward_label.duration,
+//                                 0,
+//                                 forward_label.cost + backward_label.cost,
+//                                 new_covered.unwrap(),
+//                                 0,
+//                             );
+
+//                             if !candidate_labels.iter().any(|l: &Label| l.dominates(&candidate_label, DominanceMode::DurRCCover)) {
+//                                 if candidate_labels.len() < k {
+//                                     candidate_labels.push(candidate_label);
+//                                     if candidate_label.reduced_cost > worst_rc {
+//                                         worst_rc = candidate_label.reduced_cost;
+//                                         worst_idx = candidate_labels.len() - 1;
+//                                     }
+//                                 } else {
+//                                     candidate_labels[worst_idx] = candidate_label; // Replace the worst label with the new one
+//                                     let mut idx = 0;
+//                                     let mut worst_cost = candidate_labels[0].reduced_cost;
+//                                     // Find the index of the worst label
+//                                     for (i, label) in candidate_labels.iter().enumerate() {
+//                                         if label.reduced_cost > worst_cost {
+//                                             idx = i;
+//                                             worst_cost = label.reduced_cost;
+//                                         }
+//                                     }
+//                                     worst_idx = idx; // Update the worst index
+//                                     worst_rc = worst_cost; // Update the worst reduced cost
+//                                 }
+//                             }
+//                         }  
+//                     }
+//                 }
+//             }
+//         }
+//         // Sort the candidate labels by reduced cost
+//         candidate_labels.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
+
+//         candidate_labels
+//     }
+// }
+
+// impl Pricer for QueuePricer<'_> {
+//     fn solve_pricing_problem(&mut self, verbose: bool) -> Vec<Vec<Label>> {
+//         // self.forward_pass();
+//         // let depot_labels = &self.priority_queue.finished_labels[0];
+
+//         init_manager(self.data);
+
+//         let depot_labels = self.forward_backward_pass(NUM_ROUTES_PER_NODE_CALCULATED, verbose);
+
+//         let mut labels: Vec<Label> = Vec::new();
+
+//         for idx in 0..min(NUM_ROUTES_PER_NODE_ADDED, depot_labels.len()) {
+//             let label = &depot_labels[idx];
+//             if label.reduced_cost < -EPS {
+//                 labels.retain(|l| !label.dominates(l, DominanceMode::DurRCCover));
+//                 labels.push(*label);
+//             }
+//         }
+
+//         labels
+//     }
+// }
 
 
 // pub struct BucketPricer<'a> {
@@ -849,7 +1254,7 @@ impl Pricer for QueuePricer<'_> {
 
 //         for idx in 0..min(k, self.bucket_graph.depot_bucket.len()) {
 //             let label = &self.bucket_graph.depot_bucket[idx];
-//             if label.reduced_cost < -1e-6 {
+//             if label.reduced_cost < -EPS {
 //                 labels.push(label.clone());
 //             }
 //         }
@@ -936,4 +1341,3 @@ impl Pricer for QueuePricer<'_> {
 //         self.labels.push(label); // Store the label in the labels vector
 //     }
 // }
-
