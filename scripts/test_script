@@ -1,0 +1,14 @@
+EXECUTABLE=spdp.exe 
+
+#!/bin/bash --login
+#SBATCH --job-name=test
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=5G
+#SBATCH --time=00:01:00
+#SBATCH --partition=debug
+#SBATCH -o test_script.out
+#SBATCH -e test_script.err
+
+srun $EXECUTABLE a1

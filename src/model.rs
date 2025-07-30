@@ -213,17 +213,16 @@ impl ColGenModel {
 
                 for label in route_pool.iter() {
                     let reduced_cost = match mode {
-                        LPSolvePhase::VehicleNoCover | LPSolvePhase::VehicleCover => {
+                        LPSolvePhase::VehicleNoCover | LPSolvePhase::VehicleCover | LPSolvePhase::VehicleQuantity=> {
                             1.0 - label.coverset.to_vec().iter().enumerate()
                                 .map(|(idx, amount)| *amount as f64 * cover_duals[idx])
                                 .sum::<f64>()
                         },
-                        LPSolvePhase::CostNoCover | LPSolvePhase::CostCover => {
-                            self.data.fixed_vehicle_cost as f64
+                        LPSolvePhase::CostNoCover | LPSolvePhase::CostCover | LPSolvePhase::CostQuantity => {
+                            label.cost as f64
                                 - label.coverset.to_vec().iter().enumerate()
                                     .map(|(idx, amount)| *amount as f64 * cover_duals[idx])
                                     .sum::<f64>()
-                                + label.cost as f64
                                 - vehicle_dual.unwrap_or(0.0)
                         },
                     };
@@ -247,6 +246,8 @@ impl ColGenModel {
                 if !new_routes.is_empty() {
                     if verbose {
                         println!("Found {} candidate routes in the pool", new_routes.len());
+                        new_routes.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
+                        new_routes.truncate(NUM_ROUTES_PER_NODE_ADDED * self.nodes.nodes.len());
                         // panic!("Candidate routes found in the pool, not implemented yet");
                     }
                 } else {
@@ -277,7 +278,11 @@ impl ColGenModel {
                                 break;
                             };
 
-                            new_routes.push(label);
+                            if label.reduced_cost <= -EPS {
+                                new_routes.push(label);
+                            } else {
+                                route_pool.push(label);
+                            }
                         }
 
                         for i in NUM_ROUTES_PER_NODE_ADDED..NUM_ROUTES_PER_NODE_CALCULATED {
@@ -311,8 +316,12 @@ impl ColGenModel {
                 println!("No new routes found");
                 match mode {
                     LPSolvePhase::VehicleNoCover => {
-                        mode = LPSolvePhase::VehicleCover;
+                        mode = LPSolvePhase::VehicleQuantity;
                         println!("Adding quantity checks for vehicles");
+                    },
+                    LPSolvePhase::VehicleQuantity => {
+                        mode = LPSolvePhase::VehicleCover;
+                        println!("Adding coverage checks for vehicles");
                     },
                     LPSolvePhase::VehicleCover => {
                         mode = LPSolvePhase::CostNoCover;
@@ -333,6 +342,10 @@ impl ColGenModel {
                         println!("\nCOST OPTIMIZATION PHASE");
                     },
                     LPSolvePhase::CostNoCover => {
+                        mode = LPSolvePhase::CostQuantity;
+                        println!("Adding quantity checks for costs");
+                    },
+                    LPSolvePhase::CostQuantity => {
                         mode = LPSolvePhase::CostCover;
                         println!("Adding coverage checks for costs");
                     },

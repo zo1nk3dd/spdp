@@ -310,7 +310,7 @@ impl Label {
                 self.reduced_cost - other.reduced_cost < EPS && self.duration <= other.duration
             },
             DominanceMode::DurRCCover => {
-                self.reduced_cost - other.reduced_cost < EPS && self.duration <= other.duration && self.coverset.visits_leq_than(&other.coverset)
+                self.reduced_cost - other.reduced_cost < EPS && self.duration <= other.duration && self.visits_less_eq_than(other)
             },
             DominanceMode::Dur => {
                 self.duration <= other.duration

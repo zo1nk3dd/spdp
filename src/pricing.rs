@@ -1,7 +1,9 @@
 use std::cmp::{min};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{HashMap};
 use std::fmt::Display;
 use std::{f64, fmt, vec};
+
+use grb::INFINITY;
 
 use crate::fragment::{Arc, ArcContainer, NodeContainer};
 use crate::utils::{SPDPData, Label};
@@ -20,15 +22,11 @@ pub enum DominanceMode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LPSolvePhase {
     VehicleNoCover,
+    VehicleQuantity,
     VehicleCover,
     CostNoCover,
+    CostQuantity,
     CostCover,
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct Key {
-    covered: Vec<usize>,
-    node_id: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -93,11 +91,15 @@ impl VisitedData {
         self.labels.push(new_label); // Add the label to the labels vector
         true
     }
-
+    
+    /// Checks if a label is already visited in the current phase
+    /// It needs to use the correct key based on the phase
+    /// This depends upon the logic in the `add_if_improvement` function
     fn contains_label(&self, label: &Label, phase: LPSolvePhase) -> bool {
         let bucket = &self.visited[label.node_id];
         let key = match phase {
             LPSolvePhase::VehicleNoCover | LPSolvePhase::CostNoCover => 0,
+            LPSolvePhase::VehicleQuantity | LPSolvePhase::CostQuantity => label.coverset.len as SIZE,
             LPSolvePhase::VehicleCover | LPSolvePhase::CostCover => label.coverset.covered,
         };
         if let Some(label_ids) = bucket.get(&key) {
@@ -118,158 +120,143 @@ impl VisitedData {
         assert!(self.labels.len() == label.id);
         // assert!(bucket.iter().all(|l| !l.is_empty()), "Bucket should not contain empty labels");
 
-        if bucket.is_empty() {
-            bucket.insert(label.coverset.covered, vec![label.id]);
-            self.labels.push(label);
-            return true; // If no labels visited, this is an improvement
-        }
-
         // Vehicle No Cover, we want to store only the best reduced cost label at each node
-        if phase == LPSolvePhase::VehicleNoCover || phase == LPSolvePhase::CostNoCover {
+        match phase {
+            LPSolvePhase::VehicleNoCover | LPSolvePhase::CostNoCover => {
             // assert!(bucket.len() == 1, "Bucket should contain only one label for VehicleNoCover or CostNoCover phase");
-            let label_ids = bucket.get_mut(&0);
+                let label_ids = bucket.get_mut(&0);
 
-            if let Some(label_ids) = label_ids {
-                // println!("Adding label to bucket: {:?}", label_ids);
-                // This cover set has been previously found
-                for label_id in label_ids.iter() {
-                    if self.labels[*label_id].dominates(&label, DominanceMode::DurRC) {
-                        // println!("Label with rc {:?} and dur {} dominates rc {} and dur {:?}", 
-                        //     self.labels[*label_id].reduced_cost, self.labels[*label_id].duration,
-                        //     label.reduced_cost, label.duration);
-                        self.cut_in += 1;
-                        return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+                if let Some(label_ids) = label_ids {
+                    // println!("Adding label to bucket: {:?}", label_ids);
+                    // This cover set has been previously found
+                    for label_id in label_ids.iter() {
+                        if self.labels[*label_id].dominates(&label, DominanceMode::DurRC) {
+                            // println!("Label with rc {:?} and dur {} dominates rc {} and dur {:?}", 
+                            //     self.labels[*label_id].reduced_cost, self.labels[*label_id].duration,
+                            //     label.reduced_cost, label.duration);
+                            self.cut_in += 1;
+                            return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+                        }
                     }
+                    label_ids.retain(|id| {
+                        // Remove dominated labels
+                        !label.dominates(&self.labels[*id], DominanceMode::DurRC)
+                    });
+                    label_ids.push(label.id);
                 }
-                // label_ids.retain(|id| {
-                //     // Remove dominated labels
-                //     !label.dominates(&self.labels[*id], DominanceMode::DurRC)
-                // });
-                label_ids.push(label.id);
-                self.labels.push(label);
-                return true;
-            }
 
-            else {
-                // This cover set has not been found before
-                self.better += 1; // Count this as a better label
-                bucket.insert(0, vec![label.id]);
-                self.labels.push(label); // Add the label to the labels vector
-                return true;
-            }
-        }
-        // else if phase == LPSolvePhase::VehicleQuantity {
-        //     let result = bucket.get(&(label.coverset.len as SIZE));
-
-        //     if let Some(label_ids) = result {
-        //         for id in label_ids.iter() {
-        //             if self.labels[*id].dominates(&label, DominanceMode::RC) {
-        //                 self.cut_in += 1;
-        //                 return false; // If the new label is dominated by any of the previous labels, it's not an improvement
-        //             }
-        //         }
-        //     }
-        //     if label.coverset.len > 1 {
-        //         let result = bucket.get(&(label.coverset.len as SIZE - 1));
-        //         if let Some(label_ids) = result {
-        //             for id in label_ids.iter() {
-        //                 if self.labels[*id].dominates(&label, DominanceMode::RC) {
-        //                     self.cut_in += 1;
-        //                     return false; // If the new label is dominated by any of the previous labels, it's not an improvement
-        //                 }
-        //             }
-        //         }
-        //     }
-
-        //     let result = bucket.get_mut(&(label.coverset.len as SIZE));
-
-        //     if let Some(label_ids) = result {
-        //         let len_before = label_ids.len();
-        //         label_ids.retain(|id| {
-        //             // Remove dominated labels
-        //             !label.dominates(&self.labels[*id], DominanceMode::RC)
-        //         });
-        //         let len_after = label_ids.len();
-        //         self.cut_out += len_before - len_after;
-        //         self.better += 1;
-        //         label_ids.push(label.id);
-        //     }
-        //     else {
-        //         // This cover set has not been found before;
-        //         bucket.insert(label.coverset.covered, vec![label.id]);
-        //     }
-        // }
-        // We care about the best label for each node, covered set
-        else if phase == LPSolvePhase::VehicleCover {
-            let label_ids = bucket.get_mut(&label.coverset.covered);
-
-            if let Some(label_ids) = label_ids {
-                // This cover set has been previously found
-                let prev_label = &self.labels[label_ids[0]];
-                let mode = DominanceMode::Dur;
-                if label.dominates(&prev_label, mode) {
-                    label_ids[0] = label.id; // Update the label id to the new label
-                    self.cut_out += 1;
+                else {
+                    // This cover set has not been found before
                     self.better += 1; // Count this as a better label
-                } else {
-                    self.cut_in += 1;
-                    return false; // If the new label does not dominate the best label, it's not an improvement
+                    bucket.insert(0, vec![label.id]);
                 }
-            }
+            },
+            LPSolvePhase::VehicleQuantity | LPSolvePhase::CostQuantity => {
+                let mode = DominanceMode::DurRC;
+                let result = bucket.get_mut(&(label.coverset.len as SIZE));
 
-            else {
-                // This cover set has not been found before
-                bucket.insert(label.coverset.covered, vec![label.id]);
-            }
-        }
+                if let Some(label_ids) = result {
+                    for id in label_ids.iter() {
+                        if self.labels[*id].dominates(&label, mode) {
+                            self.cut_in += 1;
+                            return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+                        }
+                    }
+                    let len_before = label_ids.len();
+                    label_ids.retain(|id| {
+                        // Remove dominated labels
+                        !label.dominates(&self.labels[*id], mode)
+                    });
+                    let len_after = label_ids.len();
+                    self.cut_out += len_before - len_after;
+                    self.better += 1;
+                    label_ids.push(label.id);
+                }
+                // if label.coverset.len > 1 {
+                //     let result = bucket.get(&(label.coverset.len as SIZE - 1));
+                //     if let Some(label_ids) = result {
+                //         for id in label_ids.iter() {
+                //             if self.labels[*id].dominates(&label, mode) {
+                //                 self.cut_in += 1;
+                //                 return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+                //             }
+                //         }
+                //     }
+                // }
+                else {
+                    // This cover set has not been found before;
+                    bucket.insert(label.coverset.len as SIZE, vec![label.id]);
+                }
+            },
+            LPSolvePhase::VehicleCover => {
+                let label_ids = bucket.get_mut(&label.coverset.covered);
 
-        else if phase == LPSolvePhase::CostCover {
-            // If we reach here, the label is an improvement
-            let result = bucket.get(&label.coverset.covered);
-
-            if let Some(label_ids) = result {
-                for id in label_ids.iter() {
-                    if self.labels[*id].dominates(&label, DominanceMode::DurRC) {
+                if let Some(label_ids) = label_ids {
+                    // This cover set has been previously found
+                    let prev_label = &self.labels[label_ids[0]];
+                    let mode = DominanceMode::Dur;
+                    if label.dominates(&prev_label, mode) {
+                        label_ids[0] = label.id; // Update the label id to the new label
+                        self.cut_out += 1;
+                        self.better += 1; // Count this as a better label
+                    } else {
                         self.cut_in += 1;
-                        return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+                        return false; // If the new label does not dominate the best label, it's not an improvement
                     }
                 }
 
-                for (request_id, request_amount) in label.coverset.to_vec().iter().enumerate() {
-                    if *request_amount == 0 {
-                        continue;
+                else {
+                    // This cover set has not been found before
+                    bucket.insert(label.coverset.covered, vec![label.id]);
+                }
+            },
+            LPSolvePhase::CostCover => {
+                // If we reach here, the label is an improvement
+                let result = bucket.get(&label.coverset.covered);
+
+                if let Some(label_ids) = result {
+                    for id in label_ids.iter() {
+                        if self.labels[*id].dominates(&label, DominanceMode::DurRC) {
+                            self.cut_in += 1;
+                            return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+                        }
                     }
-                    let mut coverset: CoverSet = label.coverset;
-                    coverset.uncover(request_id).unwrap();
-                    let result = bucket.get(&coverset.covered);
-                    if let Some(label_ids) = result {
-                        for id in label_ids.iter() {
-                            if self.labels[*id].dominates(&label, DominanceMode::DurRC) {
-                                self.cut_in += 1;
-                                return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+
+                    for (request_id, request_amount) in label.coverset.to_vec().iter().enumerate() {
+                        if *request_amount == 0 {
+                            continue;
+                        }
+                        let mut coverset: CoverSet = label.coverset;
+                        coverset.uncover(request_id).unwrap();
+                        let result = bucket.get(&coverset.covered);
+                        if let Some(label_ids) = result {
+                            for id in label_ids.iter() {
+                                if self.labels[*id].dominates(&label, DominanceMode::DurRC) {
+                                    self.cut_in += 1;
+                                    return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            let result = bucket.get_mut(&label.coverset.covered);
+                let result = bucket.get_mut(&label.coverset.covered);
 
-            if let Some(label_ids) = result {
-                let len_before = label_ids.len();
-                label_ids.retain(|id| {
-                    // Remove dominated labels
-                    !label.dominates(&self.labels[*id], DominanceMode::DurRC)
-                });
-                let len_after = label_ids.len();
-                self.cut_out += len_before - len_after;
-                self.better += 1;
-                label_ids.push(label.id);
-            }
-            else {
-                // This cover set has not been found before;
-                bucket.insert(label.coverset.covered, vec![label.id]);
-            }
+                if let Some(label_ids) = result {
+                    let len_before = label_ids.len();
+                    label_ids.retain(|id| {
+                        // Remove dominated labels
+                        !label.dominates(&self.labels[*id], DominanceMode::DurRC)
+                    });
+                    let len_after = label_ids.len();
+                    self.cut_out += len_before - len_after;
+                    self.better += 1;
+                    label_ids.push(label.id);
+                } else {
+                    // This cover set has not been found before;
+                    bucket.insert(label.coverset.covered, vec![label.id]);
+                }
+            },
         }
         self.labels.push(label); // Add the label to the labels vector
         true
@@ -622,7 +609,7 @@ impl<'a> BucketPricer<'a> {
         }
 
         for node_id in 1..self.nodes.nodes.len() {
-            let mut worst_rc = -EPS;
+            let mut worst_rc = INFINITY;
             let mut worst_idx = 0;
 
             let mut forward_bucket = forward_pass_info.get_label_ids_by_node(node_id).iter().map(|id| &forward_pass_info.labels[*id]).collect::<Vec<_>>();
@@ -634,7 +621,7 @@ impl<'a> BucketPricer<'a> {
             for forward_label in forward_bucket.iter() {
                 for backward_label in backward_bucket.iter() {
                     if forward_label.reduced_cost + backward_label.reduced_cost >= worst_rc {
-                        break; // Skip if the combined reduced cost is not negative
+                        break; // Skip if the combined reduced cost is not better
                     }
                     if forward_label.duration + backward_label.duration <= self.data.t_limit {
                         let new_covered = forward_label.coverset.combine(&backward_label.coverset);
@@ -654,7 +641,7 @@ impl<'a> BucketPricer<'a> {
                             if !candidate_labels[node_id].iter().any(|l: &Label| l.dominates(&candidate_label, DominanceMode::DurRCCover)) {
                                 if candidate_labels[node_id].len() < k {
                                     candidate_labels[node_id].push(candidate_label);
-                                    if candidate_label.reduced_cost > worst_rc {
+                                    if candidate_label.reduced_cost < worst_rc {
                                         worst_rc = candidate_label.reduced_cost;
                                         worst_idx = candidate_labels[node_id].len() - 1;
                                     }
@@ -712,14 +699,7 @@ impl Pricer for BucketPricer<'_> {
     fn solve_pricing_problem(&mut self, verbose: bool) -> Vec<Vec<Label>> {
         init_manager(self.data); // Cursed but necessary? It is what it is
 
-        let candidate_labels = match self.phase {
-            LPSolvePhase::VehicleNoCover | LPSolvePhase::CostNoCover => {
-                self.forward_backward_pass(NUM_ROUTES_PER_NODE_CALCULATED, verbose)
-            }, 
-            LPSolvePhase::VehicleCover | LPSolvePhase::CostCover => {
-                self.forward_backward_pass(NUM_ROUTES_PER_NODE_CALCULATED, verbose)
-            },
-        };
+        let candidate_labels = self.forward_backward_pass(NUM_ROUTES_PER_NODE_CALCULATED, verbose);
 
         candidate_labels
     }
