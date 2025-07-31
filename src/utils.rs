@@ -27,7 +27,7 @@ impl SPDPData {
 
         let file = match result {
             Ok(file) => file,
-            Err(e) => panic!("Error reading file: {}. Probably due to invalid instance provided.", e),
+            Err(_) => panic!("Error reading file: {}. Probably due to invalid instance provided.", filename),
         };
 
         let mut lines = file.lines();
