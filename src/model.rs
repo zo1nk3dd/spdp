@@ -1,12 +1,28 @@
 extern crate grb;
 
+use std::collections::HashMap;
+use std::collections::HashSet;
+use itertools::Itertools;
+
 use grb::attribute::ConstrDoubleAttr::RHS;
+use grb::attribute::ConstrIntAttr::IISConstr;
 use grb::attribute::ModelDoubleAttr::ObjVal;
 use grb::attribute::ModelModelSenseAttr::ModelSense;
 use grb::attribute::VarDoubleAttr::Obj;
+use grb::attribute::VarDoubleAttr::UB;
 use grb::attribute::VarDoubleAttr::X;
+use grb::attribute::VarIntAttr::IISLB;
+use grb::attribute::VarIntAttr::IISUB;
+use grb::callback;
+use grb::callback::CbResult;
+use grb::callback::MIPSolCtx;
+use grb::parameter::IntParam::LazyConstraints;
 use grb::parameter::IntParam::OutputFlag;
+use grb::parameter::StrParam::ResultFile;
 use grb::prelude::*;
+use grb::Error;
+
+use crate::model;
 
 use super::utils::*;
 use super::fragment::*;
@@ -14,16 +30,433 @@ use super::pricing::*;
 use super::constants::*;
 
 
+struct CallbackContext<'a> {
+    data: &'a SPDPData,
+    nodes: &'a NodeContainer,
+    arcs: &'a ArcContainer,
+    x: &'a Vec<Vec<Var>>,
+    verbose: bool,
+}
+
+impl<'a> CallbackContext<'a> {
+    fn new(data: &'a SPDPData, nodes: &'a NodeContainer, arcs: &'a ArcContainer, x: &'a Vec<Vec<Var>>, verbose: bool) -> Self {
+        Self {
+            data,
+            nodes,
+            arcs,
+            x,
+            verbose,
+        }
+    }
+
+    fn callback_mipsol(&mut self, ctx: MIPSolCtx) {
+        for (_, arcs) in self.x.iter().enumerate() {
+            let soln = ctx.get_solution(arcs).unwrap();
+            let mut sets: Vec<HashSet<usize>> = Vec::new();
+            for arc_id in 0..arcs.len() {
+                let val = soln[arc_id];
+                if val > EPS {
+                    let nodes: Vec<usize> = vec![
+                        self.arcs.arcs[arc_id].start.id,
+                        self.arcs.arcs[arc_id].end.id,
+                    ];
+                    sets.push(HashSet::from_iter(nodes));
+                }
+            }
+
+            // See if any of these overlap
+            // Iterate over every pair of sets
+            let mut i = 0;
+            let mut j = 1;
+
+            while i < sets.len() - 1 {
+                if !sets[i].is_disjoint(&sets[j]) {
+                    // Found an overlap
+                    let set1 = sets.remove(i);
+                    let set2 = sets.remove(j-1);
+                    let mut new_set = HashSet::new();
+                    for x in set1.union(&set2) {
+                        new_set.insert(*x);
+                    }
+                    sets.push(new_set);
+
+                    i = 0;
+                    j = 1;
+                    continue;
+                }
+                j += 1;
+                if j >= sets.len() {
+                    i += 1;
+                    j = i + 1;
+                }
+            }
+
+            for set in sets {
+                if !set.contains(&0) {
+                    if self.verbose { println!("Cutting cycle of {:?}", set); }
+                    // Create a cut
+                    for k in 0..self.x.len() {
+                        let arcs_enter = set.iter().map(|node_id| {
+                            let node = self.nodes.nodes.get(*node_id).unwrap();
+                            self.arcs.arcs_to.get(node).unwrap().iter()
+                                .filter_map(|arc| {
+                                    if !set.contains(&arc.start.id) {
+                                        Some((self.data.t_limit - arc.time) * self.x[k][arc.id])
+                                    } else {
+                                        None
+                                    }
+                                }).collect::<Vec<_>>()
+                        }).flatten().grb_sum();
+
+                        let arcs_leave = set.iter().map(|node_id| {
+                            let node = self.nodes.nodes.get(*node_id).unwrap();
+                            self.arcs.arcs_from.get(node).unwrap().iter()
+                                .filter_map(|arc| {
+                                    if !set.contains(&arc.end.id) {
+                                        Some(arc.time * self.x[k][arc.id])
+                                    } else {
+                                        None
+                                    }
+                                }).collect::<Vec<_>>()
+                        }).flatten().grb_sum();
+
+                        let arcs_inside = set.iter().map(|node_id| {
+                            let node = self.nodes.nodes.get(*node_id).unwrap();
+                            self.arcs.arcs_from.get(node).unwrap().iter()
+                                .filter_map(|arc| {
+                                    if set.contains(&arc.end.id) {
+                                        Some(arc.time * self.x[k][arc.id])
+                                    } else {
+                                        None
+                                    }
+                                }).collect::<Vec<_>>()
+                        }).flatten().grb_sum();
+
+                        ctx.add_lazy(c!(arcs_inside + arcs_leave <= arcs_enter)).unwrap();
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl callback::Callback for CallbackContext<'_> {
+    fn callback(&mut self, where_: Where) -> CbResult {
+        match where_ {
+            Where::MIPSol(ctx) => {
+                // Handle MIP solution context
+                self.callback_mipsol(ctx);
+            }
+            _ => {}
+        }
+        CbResult::Ok(())
+    }
+}
+
+
 pub struct MasterProblemModel {
     pub data : SPDPData,
     pub arcs : ArcContainer,
     pub nodes: NodeContainer,
     pub model: Model,
-    pub omega: Vec<Var>,
+    pub x: Vec<Vec<Var>>,
     pub cover: Vec<Constr>,
-    pub flow: Vec<Constr>,
-    pub c: Vec<f64>,
+    pub flow: Vec<Vec<Constr>>,
+    pub time_lim: Vec<Constr>,
+    pub set_z: Vec<Constr>,
+    pub sym_z: Vec<Constr>,
     pub a: Vec<Vec<f64>>,
+    pub vehicle_limit: Constr,
+    pub single_request_symmetry: Vec<Constr>,
+}
+
+impl MasterProblemModel {
+    pub fn new(data: SPDPData, arc_container: ArcContainer, node_container: NodeContainer, vehicle_count: usize) -> Self {
+
+        let mut model = Model::new("Master Problem").unwrap();
+
+        let mut a: Vec<Vec<f64>> = vec![vec![0.0; arc_container.num_arcs()]; data.num_requests];
+
+        for arc in arc_container.arcs.iter() {
+            if arc.done.len() > 0 {
+                a[arc.done.left()][arc.id] += 1.0;
+            }
+            if arc.done.len() == 2 {
+                a[arc.done.right()][arc.id] += 1.0;
+            }
+        }
+
+        let x: Vec<Vec<Var>> = (0..vehicle_count)
+            .map(|vehicle_id: usize| {
+                (0..arc_container.num_arcs()).map(|arc_id| {
+                    let arc = &arc_container.arcs[arc_id];
+                    add_var!(model, Integer, name: &format!("a_{arc_id}_v{vehicle_id}"), obj: arc.cost as f64).unwrap()
+                }).collect()
+            })
+            .collect();
+
+        let z: Vec<Var> = (0..vehicle_count).map(|vehicle_id| {
+            add_var!(model, Binary, name: &format!("z_{vehicle_id}"), obj: 0.0).unwrap()
+        }).collect();
+
+        let cover: Vec<Constr> = data.requests.iter()
+            .enumerate()
+            .map(|(r_id, request)| {
+                let constr_expr = x.iter().enumerate()
+                    .map(|(_, xs)| {
+                        xs.iter().zip(a[r_id].iter()).map(|(arc, coeff)| *coeff * *arc).grb_sum()
+                    })
+                    .grb_sum();
+
+                let quantity = request.quantity as f64;
+
+                model.add_constr(
+                    &format!("request_{}", r_id),
+                    c!(constr_expr == quantity)
+                ).unwrap()
+            })
+            .collect();
+
+        let flow: Vec<Vec<Constr>> = node_container.nodes
+            .iter()
+            .enumerate()
+            .map(|(node_id, node)| {
+                (0..vehicle_count).map(|vehicle_id| {
+                    let inflow = arc_container.arcs_to.get(node).unwrap()
+                        .iter()
+                        .map(|arc| x[vehicle_id][arc.id])
+                        .grb_sum();
+
+                    let outflow = arc_container.arcs_from.get(node).unwrap()
+                        .iter()
+                        .map(|arc| x[vehicle_id][arc.id])
+                        .grb_sum();
+
+                    model.add_constr(
+                        &format!("flow_{}_{}", node_id, vehicle_id),
+                        c!(inflow == outflow)
+                    ).unwrap()
+                }).collect()
+            })
+            .collect();
+
+        let time_lim: Vec<Constr> = (0..vehicle_count)
+            .map(|vehicle_id| {
+                let lhs = arc_container.arcs.iter().map(|arc| {
+                    arc.time * x[vehicle_id][arc.id]
+                }).grb_sum();
+                model.add_constr(
+                    &format!("time_lim_{}", vehicle_id),
+                    c!(lhs <= data.t_limit as f64 * z[vehicle_id])
+                ).unwrap()
+            })
+            .collect();
+
+        let set_z: Vec<Constr> = (0..vehicle_count)
+            .map(|vehicle_id| {
+                let rhs = arc_container.arcs_from.get(&node_container.depot).unwrap()
+                    .iter()
+                    .map(|arc| x[vehicle_id][arc.id])
+                    .grb_sum();
+                model.add_constr(
+                    &format!("set_z_{}", vehicle_id),
+                    c!(z[vehicle_id] == rhs)
+                ).unwrap()
+            })
+            .collect();
+
+        let sym_z: Vec<Constr> = (1..vehicle_count)
+            .map(|vehicle_id| {
+                let lhs = z[vehicle_id];
+                let rhs = z[vehicle_id - 1];
+                model.add_constr(
+                    &format!("sym_z_{}", vehicle_id),
+                    c!(lhs <= rhs)
+                ).unwrap()
+            })
+            .collect();
+
+        let vehicle_limit = model.add_constr(
+            "vehicle_limit",
+            c!(z.iter().grb_sum() == vehicle_count as f64)
+        ).unwrap();
+
+        // Inequalities
+        let single_request_symmetry: Vec<Constr> = data.requests.iter().enumerate()
+            .filter(|(idx, r)| r.quantity == 1 && idx < &vehicle_count)
+            .map(|(idx, r)| {
+                let lhs = (0..vehicle_count).filter(|k| k > &idx).map(|k| {
+                    arc_container.arcs.iter().filter_map(|arc| {
+                        if a[idx][arc.id] == 1.0 {
+                            Some(x[k][arc.id])
+                        } else {
+                            None
+                        }
+                    }).grb_sum()
+                }).grb_sum();
+                model.add_constr(
+                    &format!("single_request_symmetry_{}", idx),
+                    c!(lhs == 0.0)
+                ).unwrap()
+            }).collect();
+
+        // Subset-row
+
+        let basic_odd_requests: Vec<Constr> = data.requests.iter().enumerate()
+            .filter(|(r_id, r)| r.quantity % 2 == 1 || r.quantity > 2)
+            .map(|(r_id, r)| {
+                let lhs = (0..vehicle_count).map(|k| {
+                    arc_container.arcs.iter().filter_map(|arc| {
+                        if a[r_id][arc.id] == 2.0 {
+                            Some(x[k][arc.id])
+                        } else {
+                            None
+                        }
+                    }).grb_sum()
+                }).grb_sum();
+                let rhs = (r.quantity / 2) as f64;
+
+                model.add_constr(
+                    &format!("odd_request_{}", r_id),
+                    c!(lhs <= rhs)
+                ).unwrap()
+            }).collect();
+
+        for location in node_container.pickup_nodes.iter() {
+            let requests_at_location: Vec<(usize, &Request)> = data.requests.iter().enumerate()
+                .filter(|(r_id, r)| r.from_id == location.id)
+                .collect();
+
+            let quantity_sum = requests_at_location.iter().map(|(r_id, r)| r.quantity).sum::<usize>();
+
+            if quantity_sum > 2 && quantity_sum % 2 == 1 && requests_at_location.len() > 1 {
+                let lhs = (0..vehicle_count).map(|k| {
+                    arc_container.arcs.iter().filter_map(|arc| {
+                        let q = requests_at_location.iter().map(|(r_id, r)| a[*r_id][arc.id]).sum::<f64>();
+                        if q == 2.0 {
+                            Some(x[k][arc.id])
+                        } else {
+                            None
+                        }
+                    }).grb_sum()
+                }).grb_sum();
+                let rhs = (quantity_sum / 2) as f64;
+
+                model.add_constr(
+                    &format!("odd_location_{}", location.id),
+                    c!(lhs <= rhs)
+                ).unwrap();   
+            }
+        }
+
+        // For each subset of the requests of size 2 or 3
+        let request_ids: Vec<usize> = (0..data.num_requests).collect();
+        let subsets_2 = request_ids.iter().combinations(2);
+        let subsets_3 = request_ids.iter().combinations(3);
+
+        for set in subsets_2.chain(subsets_3) {
+            if set.iter().map(|r_id| data.requests[**r_id].quantity).sum::<usize>() != 3 {
+                continue; // All requests must be from different locations
+            }
+
+            let treatment = data.requests[*set[0]].to_id;
+
+            if set.iter().all(|r_id| data.requests[**r_id].to_id == treatment) {
+                // add the constraint
+                let lhs = (0..vehicle_count).map(|k| {
+                    arc_container.arcs.iter().filter_map(|arc| {
+                        let q = set.iter().map(|r_id| a[**r_id][arc.id]).sum::<f64>();
+                        if q == 2.0 {
+                            Some(x[k][arc.id])
+                        } else {
+                            None
+                        }
+                    }).grb_sum()
+                }).grb_sum();
+                model.add_constr(
+                    &format!("treatment_{}", set.iter().map(|r_id| r_id.to_string()).collect::<Vec<String>>().join("_")),
+                    c!(lhs <= 1.0)
+                ).unwrap();
+            }
+
+            let deliver = data.requests[*set[0]].from_id;
+
+            if set.iter().all(|r_id| data.requests[**r_id].from_id == deliver) {
+                // add the constraint
+                let lhs = (0..vehicle_count).map(|k| {
+                    arc_container.arcs.iter().filter_map(|arc| {
+                        let q = set.iter().map(|r_id| a[**r_id][arc.id]).sum::<f64>();
+                        if q == 2.0 {
+                            Some(x[k][arc.id])
+                        } else {
+                            None
+                        }
+                    }).grb_sum()
+                }).grb_sum();
+                model.add_constr(
+                    &format!("deliver_{}", set.iter().map(|r_id| r_id.to_string()).collect::<Vec<String>>().join("_")),
+                    c!(lhs <= 1.0)
+                ).unwrap();
+            }
+        }
+
+        Self {
+            data,
+            arcs: arc_container,
+            nodes: node_container,
+            model,
+            x,
+            cover,
+            flow,
+            time_lim,
+            set_z,
+            sym_z,
+            a,
+            vehicle_limit,
+            single_request_symmetry
+        }
+    }
+
+    pub fn filter_arcs(&mut self, lbs: &HashMap<usize, f64>, zlb: f64, zub: f64) {
+        let mut filtered = 0;
+        for (arc_id, lb) in lbs.iter() {
+            let arc = &self.arcs.arcs[*arc_id];
+            assert!(*arc_id == arc.id);
+            if *lb > (zub - zlb) + EPS {
+                for vehicle_id in 0..self.x.len() {
+                    self.model.set_obj_attr(UB, &self.x[vehicle_id][*arc_id], 0.0).unwrap();
+                }
+                filtered += 1;
+            } else {
+                for vehicle_id in 0..self.x.len() {
+                    self.model.set_obj_attr(UB, &self.x[vehicle_id][*arc_id], 1e20).unwrap();
+                }
+            }
+        }
+        println!("Filtered {}/{} arcs from the master problem", filtered, lbs.len());
+    }
+
+    pub fn solve(&mut self, verbose: bool) -> Result<f64, Error> {
+        self.model.set_attr(ModelSense, Minimize).unwrap();
+        self.model.set_param(LazyConstraints, 1).unwrap();
+        let mut callback_context = CallbackContext::new(&self.data, &self.nodes, &self.arcs, &self.x, verbose);
+        self.model.optimize_with_callback(&mut callback_context).unwrap();
+
+        self.model.get_attr(attr::ObjVal)
+    }
+
+    pub fn print_solution(&self) {
+        // Print the solution details
+        for (k, vars) in self.x.iter().enumerate() {
+            for (i, lambda) in vars.iter().enumerate() {
+                let obj = self.model.get_obj_attr(X, lambda).unwrap();
+                if obj > EPS {
+                    println!("Vehicle {}, Arc {}: {}", k, i, obj);
+                    println!("    Arc details: start: {:?}, end: {:?}, cost: {}, time: {}", self.arcs.arcs[i].start, self.arcs.arcs[i].end, self.arcs.arcs[i].cost, self.arcs.arcs[i].time);
+                }
+            }
+        }
+    }
 }
 
 pub struct ColGenModel {
@@ -155,7 +588,12 @@ impl ColGenModel {
         }
     }
 
-    pub fn solve(&mut self, verbose: bool) {
+    /// Solves the column generation model
+    /// # Arguments
+    /// * `verbose` - If true, prints detailed information about the solving process
+    /// # Returns
+    /// The optimal objective value found by the model
+    pub fn solve(&mut self, verbose: bool) -> f64 {
         self.model.set_param(OutputFlag, 0).unwrap();
         self.model.set_attr(ModelSense, Minimize).unwrap();
 
@@ -190,7 +628,24 @@ impl ColGenModel {
                 if verbose {
                     println!("Smallest possible vehicles count of 1 is found");
                 }
-                mode = LPSolvePhase::VehicleCover; // This will skip straight to cost optimization
+                println!("Optimal number of vehicles found after {} iterations", iter);
+                let obj = self.model.get_attr(attr::ObjVal).unwrap();
+                best_vehicle_count = obj.ceil() as usize;
+                self.max_vehicles = Some(best_vehicle_count);
+
+                self.vehicle_constraint = Some(self.model.add_constr(
+                    "vehicle_constraint",
+                    c!(self.lambda.iter().grb_sum() >= best_vehicle_count as f64)
+                ).unwrap());
+
+                for (idx, var) in self.lambda.iter().enumerate() {
+                    self.model.set_obj_attr(attr::Obj, var, self.route_costs[idx]).unwrap();
+                }
+                mode = LPSolvePhase::CostNoCover; // This will skip straight to cost optimization
+                if verbose {
+                    println!("\nCOST OPTIMIZATION PHASE");
+                }
+                continue;
             } else {
                 let cover_duals = self.cover_constraints.iter()
                     .map(|c| self.model.get_obj_attr(attr::Pi, c).unwrap())
@@ -314,6 +769,8 @@ impl ColGenModel {
 
             if new_routes.is_empty() {
                 println!("No new routes found");
+
+
                 match mode {
                     LPSolvePhase::VehicleNoCover => {
                         mode = LPSolvePhase::VehicleQuantity;
@@ -352,9 +809,38 @@ impl ColGenModel {
                     LPSolvePhase::CostCover => {
                         // Successfully solved the second phase of the problem
                         println!("Optimal obj {} found after {} iterations", self.model.get_attr(ObjVal).unwrap(), iter);
-                        break;
+                        return self.model.get_attr(attr::ObjVal).unwrap();
                     },
                 }
+
+                // match mode {
+                //     LPSolvePhase::VehicleNoCover => {
+                //         mode = LPSolvePhase::CostNoCover;
+                //         println!("Optimal number of vehicles found after {} iterations", iter);
+                //         let obj = self.model.get_attr(attr::ObjVal).unwrap();
+                //         best_vehicle_count = obj.ceil() as usize;
+                //         self.max_vehicles = Some(best_vehicle_count);
+
+                //         self.vehicle_constraint = Some(self.model.add_constr(
+                //             "vehicle_constraint",
+                //             c!(self.lambda.iter().grb_sum() >= best_vehicle_count as f64)
+                //         ).unwrap());
+
+                //         for (idx, var) in self.lambda.iter().enumerate() {
+                //             self.model.set_obj_attr(attr::Obj, var, self.route_costs[idx]).unwrap();
+                //         }
+
+                //         println!("\nCOST OPTIMIZATION PHASE");
+                //     },
+                //     LPSolvePhase::CostNoCover => {
+                //         // Successfully solved the second phase of the problem
+                //         println!("Optimal obj {} found after {} iterations", self.model.get_attr(ObjVal).unwrap(), iter);
+                //         return self.model.get_attr(attr::ObjVal).unwrap();
+                //     },
+                //     LPSolvePhase::CostCover | LPSolvePhase::VehicleCover | LPSolvePhase::CostQuantity | LPSolvePhase::VehicleQuantity => {
+                //         panic!("Unexpected mode: {:?}", mode);
+                //     },
+                // }
             }
 
             // if new_routes.is_empty() && !mode.coverage {
@@ -406,6 +892,46 @@ impl ColGenModel {
             iter += 1;
             println!();
         }
+    }
+
+    pub fn get_lower_bounds(&mut self, verbose: bool) -> HashMap<usize, f64> {
+        if verbose {
+            println!("Calculating lower bounds for arcs");
+        }
+
+        self.model.optimize().unwrap();
+        let result = self.model.get_attr(attr::Status).unwrap();
+
+        if result == grb::Status::Infeasible {
+            panic!("Model is infeasible, cannot calculate lower bounds");
+        }
+
+        let cover_duals = self.cover_constraints.iter()
+            .map(|c| self.model.get_obj_attr(attr::Pi, c).unwrap())
+            .collect::<Vec<_>>();
+        let vehicle_dual = if self.max_vehicles.is_some() {
+            Some(self.model.get_obj_attr(attr::Pi, self.vehicle_constraint.as_ref().unwrap()).unwrap())
+        } else {
+            None
+        };
+
+        if verbose {
+            println!("Cover duals: {:?}", cover_duals);
+            if let Some(dual) = vehicle_dual {
+                println!("Vehicle dual: {:?}", dual);
+            }
+        }
+
+        let mut pricer = BucketPricer::new(
+            &self.data,
+            &self.nodes,
+            &self.arcs,
+            cover_duals,
+            vehicle_dual,
+            if vehicle_dual.is_some() { LPSolvePhase::CostCover } else { LPSolvePhase::VehicleCover }, // mode
+        );
+
+        pricer.calculate_lower_rc_bounds(verbose)
     }
 }
 

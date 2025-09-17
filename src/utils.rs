@@ -108,6 +108,7 @@ impl SPDPData {
         println!("New Requests: {:?}", new_requests.len());
         
         requests = new_requests;
+        requests.sort_by(|a, b| a.quantity.cmp(&b.quantity));
 
         assert!(lines.next().unwrap().starts_with("Distance"));
 
@@ -332,7 +333,6 @@ impl fmt::Display for Label {
             self.reduced_cost, self.duration, self.node_id)
     }
 }
-
 
 // Short tests to confirm the data loading is functional
 #[cfg(test)]

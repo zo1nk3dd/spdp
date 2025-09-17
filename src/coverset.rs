@@ -17,7 +17,7 @@ impl CoverSetManager {
         let mut current_offset = 0;
         for request_id in 0..data.num_requests {
             let request = &data.requests[request_id];
-            let q = request.quantity as SIZE;
+            let q = (request.quantity) as SIZE; // turn this back
             let num_bits = (q as f64 + 0.5).log2().ceil() as usize;
             let overflow_bit = num_bits;
 
