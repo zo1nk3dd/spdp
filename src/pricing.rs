@@ -2,8 +2,10 @@ use core::{num, panic};
 use std::cmp::{min};
 use std::collections::{HashMap};
 use std::fmt::Display;
+use std::os::windows::io::HandleOrInvalid;
 use std::time::{Duration, Instant};
 use std::{f64, fmt, vec};
+use std::thread;
 
 use grb::INFINITY;
 
@@ -723,20 +725,16 @@ impl<'a> BucketPricer<'a> {
         println!("Calculating lower bounds for {} arcs", self.arcs.arcs.len());
         let mut now = Instant::now();
         // Calculate the lowest reduced cost for every arc
-
-        let mut dur_misses = 0;
-        let mut cover_misses = 0;
-        let mut cost_skips = 0;
-
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut handles = vec![];
         for arc in self.arcs.arcs.iter() {
             if Instant::now() - now > Duration::from_secs(10) {
                 println!("Processed {} arcs", lower_bounds.len());
                 now = Instant::now();
             }
-            let mut lowest_reduced_cost = INFINITY;
-            
-            let mut forward_labels = forward_pass_info.get_label_ids_by_node(arc.start.id).iter().map(|id| &forward_pass_info.labels[*id]).collect::<Vec<_>>();
-            let backward_buckets = &backward_buckets_by_node[arc.end.id];
+
+            let mut forward_labels: Vec<Label> = forward_pass_info.get_label_ids_by_node(arc.start.id).iter().map(|id| forward_pass_info.labels[*id].clone()).collect::<Vec<_>>();
+            let backward_buckets = backward_buckets_by_node[arc.end.id].clone();
 
             // if verbose {
             //     println!("Calculating lower bound for arc {} -> {}", arc.start.id, arc.end.id);
@@ -764,131 +762,114 @@ impl<'a> BucketPricer<'a> {
                 arc_reduced_cost -= reduction;
             }
 
-            if arc.start.id == 0 {
-                'backward: for (idx, backward_label) in backward_buckets.iter().flatten().enumerate() {
-                    if arc.time + backward_label.duration > self.data.t_limit {
-                        dur_misses += 1;
-                        continue; // Skip if the backward label exceeds the time limit
-                    }
-                    let reduced_cost = backward_label.reduced_cost + arc_reduced_cost - self.vehicle_rc.unwrap_or(1.0) as f64;
-                    if reduced_cost >= lowest_reduced_cost {
-                        cost_skips += backward_buckets.iter().flatten().count() - idx;
+            let t_limit = self.data.t_limit;
+            let covered = covered;
+            let tx1 = tx.clone();
+            let min_fragment_length = self.arcs.min_fragment_length;
+            let vehicle_rc = self.vehicle_rc;
+            let arc_copy = arc.clone();
 
-                        break; // Skip if the reduced cost is not lower
-                    }
-                    let result = backward_label.coverset.combine(&covered);
-                    if result.is_err() {
-                        cover_misses += 1;
-                        continue 'backward; // Skip if the cover sets cannot be combined
-                    }
-      
-                    if reduced_cost < lowest_reduced_cost {
-                        lowest_reduced_cost = reduced_cost;
-                    }
-                    cost_skips += backward_buckets.iter().flatten().count() - idx;
-                    break;
-                }
-            }
+            let handle = thread::spawn(move || {
+                let bound = BucketPricer::calculate_lower_bound_for_arc(&arc_copy, forward_labels, backward_buckets, arc_reduced_cost, covered, t_limit, min_fragment_length, vehicle_rc);
+                tx1.send((arc_copy.id, bound)).unwrap();
+            });
+            handles.push(handle);
 
-            else if arc.end.id == 0 {
-                'forward: for (idx, forward_label) in forward_labels.iter().enumerate() {
-                    if forward_label.duration + arc.time > self.data.t_limit {
-                        dur_misses += 1;
-                        continue; // Skip if the forward label exceeds the time limit
-                    }
-                    let reduced_cost = forward_label.reduced_cost + arc_reduced_cost as f64;
-                    if reduced_cost >= lowest_reduced_cost {
-                        cost_skips += forward_labels.len() - idx;
-                        break; // Skip if the reduced cost is not lower
-                    }
-
-                    let result = forward_label.coverset.combine(&covered);
-                    if result.is_err() {
-                        cover_misses += 1;
-                        continue 'forward; // Skip if the cover sets cannot be combined
-                    }
-      
-                    if reduced_cost < lowest_reduced_cost {
-                        lowest_reduced_cost = reduced_cost;
-                    }
-                    cost_skips += backward_buckets.iter().flatten().count() - idx;
-                    break;
-                }
-            }
-            
-            else {
-                'forward: for forward_label in forward_labels {
-                    if forward_label.duration + arc.time > self.data.t_limit {
-                        if verbose {
-                            // println!("  Continuing forward, time exceeded");
-                        }
-                        continue 'forward; // Skip if the forward label exceeds the time limit
-                    }
-                    let arrive_time = arc.time + forward_label.duration;
-                    let earliest_bucket = arrive_time / self.arcs.min_fragment_length;
-                    'bucket: for backwards_bucket in backward_buckets.iter().skip(earliest_bucket) {
-                        'backward: for (bucket_idx, backward_label) in backwards_bucket.iter().enumerate() {
-                            let reduced_cost = forward_label.reduced_cost + backward_label.reduced_cost + arc_reduced_cost as f64;
-                            if reduced_cost >= lowest_reduced_cost {
-                                if verbose {
-                                    cost_skips += backward_buckets.len() - bucket_idx
-                                    // println!("  break backward, rc {} >= lowest {}", reduced_cost, lowest_reduced_cost);
-                                }
-                                continue 'bucket; // Skip if the reduced cost is not lower
-                            }
-
-                            if arc.time + backward_label.duration + forward_label.duration > self.data.t_limit {
-                                if verbose {
-                                    dur_misses += 1;
-                                    // println!("  continue backward, time exceeded");
-                                }
-                                continue 'backward; // Skip if the backward label exceeds the time limit
-                            }
-                            
-                            let result = forward_label.coverset.combine(&backward_label.coverset);
-                            if result.is_err() {
-                                if verbose {
-                                    cover_misses += 1;
-                                    // println!("  continue backward, cover sets cannot be combined");
-                                }
-                                continue 'backward; // Skip if the cover sets cannot be combined
-                            }
-
-                            let result = result.unwrap().combine(&covered);
-                            if result.is_err() {
-                                if verbose {
-                                    cover_misses += 1;
-                                    // println!("  continue backward, cover sets cannot be combined");
-                                }
-                                continue 'backward; // Skip if the cover sets cannot be combined
-                            }
-
-                            if verbose {
-                                // println!("Found lower cost route for arc {} -> {} with rc {}", arc.start.id, arc.end.id, reduced_cost);
-                            }
-
-                            if reduced_cost < lowest_reduced_cost {
-                                lowest_reduced_cost = reduced_cost;
-                            }
-
-                            cost_skips += backward_buckets.len() - bucket_idx;
-
-                            continue 'bucket;
-                        }
-                    }
-                }
-            }
-            if verbose {
-                // println!("Arc {} -> {} has lower bound {}", arc.start.id, arc.end.id, lowest_reduced_cost);
-            }
-            lower_bounds.insert(arc.id, lowest_reduced_cost);
         }
-        if verbose {
-            println!(" Duration misses: {}", dur_misses);
-            println!(" Cover misses   : {}", cover_misses);
-            println!(" Cost skips     : {}", cost_skips);
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        drop(tx); // Close the channel
+        for (arc_id, bound) in rx {
+            lower_bounds.insert(arc_id, bound);
         }
         lower_bounds
+    }
+
+    fn calculate_lower_bound_for_arc(arc: &Arc, forward_labels: Vec<Label>, backward_buckets: Vec<Vec<Label>>, arc_reduced_cost: f64, covered: CoverSet, t_limit: usize, min_fragment_length: usize, vehicle_rc: Option<f64>) -> f64 {
+        let mut lowest_reduced_cost = INFINITY;
+        if arc.start.id == 0 {
+            'backward: for (idx, backward_label) in backward_buckets.iter().flatten().enumerate() {
+                if arc.time + backward_label.duration > t_limit {
+                    continue; // Skip if the backward label exceeds the time limit
+                }
+                let reduced_cost = backward_label.reduced_cost + arc_reduced_cost - vehicle_rc.unwrap_or(1.0) as f64;
+                if reduced_cost >= lowest_reduced_cost {
+
+                    break; // Skip if the reduced cost is not lower
+                }
+                let result = backward_label.coverset.combine(&covered);
+                if result.is_err() {
+                    continue 'backward; // Skip if the cover sets cannot be combined
+                }
+
+                if reduced_cost < lowest_reduced_cost {
+                    lowest_reduced_cost = reduced_cost;
+                }
+                break;
+            }
+        }
+
+        else if arc.end.id == 0 {
+            'forward: for (idx, forward_label) in forward_labels.iter().enumerate() {
+                if forward_label.duration + arc.time > t_limit {
+                    continue; // Skip if the forward label exceeds the time limit
+                }
+                let reduced_cost = forward_label.reduced_cost + arc_reduced_cost as f64;
+                if reduced_cost >= lowest_reduced_cost {
+                    break; // Skip if the reduced cost is not lower
+                }
+
+                let result = forward_label.coverset.combine(&covered);
+                if result.is_err() {
+                    continue 'forward; // Skip if the cover sets cannot be combined
+                }
+
+                if reduced_cost < lowest_reduced_cost {
+                    lowest_reduced_cost = reduced_cost;
+                }
+                break;
+            }
+        }
+
+        else {
+            'forward: for forward_label in forward_labels {
+                if forward_label.duration + arc.time > t_limit {
+                    continue 'forward; // Skip if the forward label exceeds the time limit
+                }
+                let arrive_time = arc.time + forward_label.duration;
+                let earliest_bucket = arrive_time / min_fragment_length;
+                'bucket: for backwards_bucket in backward_buckets.iter().skip(earliest_bucket) {
+                    'backward: for (bucket_idx, backward_label) in backwards_bucket.iter().enumerate() {
+                        let reduced_cost = forward_label.reduced_cost + backward_label.reduced_cost + arc_reduced_cost as f64;
+                        if reduced_cost >= lowest_reduced_cost {
+                            continue 'bucket; // Skip if the reduced cost is not lower
+                        }
+
+                        if arc.time + backward_label.duration + forward_label.duration > t_limit {
+                            continue 'backward; // Skip if the backward label exceeds the time limit
+                        }
+                        
+                        let result = forward_label.coverset.combine(&backward_label.coverset);
+                        if result.is_err() {
+                            continue 'backward; // Skip if the cover sets cannot be combined
+                        }
+
+                        let result = result.unwrap().combine(&covered);
+                        if result.is_err() {
+                            continue 'backward; // Skip if the cover sets cannot be combined
+                        }
+
+                        if reduced_cost < lowest_reduced_cost {
+                            lowest_reduced_cost = reduced_cost;
+                        }
+
+                        continue 'bucket;
+                    }
+                }
+            }
+        }
+        lowest_reduced_cost
     }
 }
 
