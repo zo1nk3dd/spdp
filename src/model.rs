@@ -417,19 +417,19 @@ impl MasterProblemModel {
         }
     }
 
-    pub fn filter_arcs(&mut self, lbs: &HashMap<usize, f64>, zlb: f64, zub: f64) {
+    pub fn filter_arcs(&mut self, lbs: &Vec<f64>, zlb: f64, zub: f64) {
         let mut filtered = 0;
-        for (arc_id, lb) in lbs.iter() {
-            let arc = &self.arcs.arcs[*arc_id];
-            assert!(*arc_id == arc.id);
+        for (arc_id, lb) in lbs.iter().enumerate() {
+            let arc = &self.arcs.arcs[arc_id];
+            assert!(arc_id == arc.id);
             if *lb > (zub - zlb) + EPS {
                 for vehicle_id in 0..self.x.len() {
-                    self.model.set_obj_attr(UB, &self.x[vehicle_id][*arc_id], 0.0).unwrap();
+                    self.model.set_obj_attr(UB, &self.x[vehicle_id][arc_id], 0.0).unwrap();
                 }
                 filtered += 1;
             } else {
                 for vehicle_id in 0..self.x.len() {
-                    self.model.set_obj_attr(UB, &self.x[vehicle_id][*arc_id], 1e20).unwrap();
+                    self.model.set_obj_attr(UB, &self.x[vehicle_id][arc_id], 1e20).unwrap();
                 }
             }
         }
@@ -694,6 +694,7 @@ impl ColGenModel {
                             cost: label.cost,
                             coverset: label.coverset,
                             node_id: label.node_id,
+                            in_arc: label.in_arc,
                         });
                     }
                 }
@@ -894,7 +895,7 @@ impl ColGenModel {
         }
     }
 
-    pub fn get_lower_bounds(&mut self, verbose: bool) -> HashMap<usize, f64> {
+    pub fn get_lower_bounds(&mut self, verbose: bool, gap: f64) -> Vec<f64> {
         if verbose {
             println!("Calculating lower bounds for arcs");
         }
@@ -931,7 +932,7 @@ impl ColGenModel {
             if vehicle_dual.is_some() { LPSolvePhase::CostCover } else { LPSolvePhase::VehicleCover }, // mode
         );
 
-        pricer.calculate_lower_rc_bounds(verbose)
+        pricer.calculate_lower_rc_bounds(verbose, gap)
     }
 }
 

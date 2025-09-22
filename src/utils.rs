@@ -269,7 +269,8 @@ pub struct Label {
     pub id: usize,
     pub reduced_cost: f64,
     pub duration: usize,
-    pub predecessor: usize,
+    pub predecessor: Option<usize>,
+    pub in_arc: usize,
     pub cost: usize,
     pub coverset: CoverSet,
     pub node_id: usize,
@@ -290,7 +291,7 @@ impl PartialOrd for Label {
 }
 
 impl Label {
-    pub fn new(id: usize, reduced_cost: f64, duration: usize, predecessor: usize, cost: usize, coverset: CoverSet, node_id: usize,) -> Self {    
+    pub fn new(id: usize, reduced_cost: f64, duration: usize, predecessor: Option<usize>, cost: usize, coverset: CoverSet, node_id: usize, in_arc: usize,) -> Self {    
         Label {
             id,
             reduced_cost,
@@ -299,6 +300,7 @@ impl Label {
             cost,
             coverset,
             node_id,
+            in_arc,
         }
     }
 

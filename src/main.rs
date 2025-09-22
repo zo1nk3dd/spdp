@@ -3,6 +3,8 @@ use spdp::utils::*;
 use std::env;
 
 fn main() {
+    let start = std::time::Instant::now();
+
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         println!("Usage: cargo run <instance> <--verbose>");
@@ -31,7 +33,9 @@ fn main() {
     let v_count = model.max_vehicles.unwrap();
     println!("Number of vehicles: {}", v_count);
 
-    let lbs = model.get_lower_bounds(verbose);
+    println!("Time elapsed: {:?}", start.elapsed());
+
+    let lbs: Vec<f64> = model.get_lower_bounds(verbose, zub-zlb);
 
     let mut master = MasterProblemModel::new(data.clone(), model.arcs, model.nodes, v_count);
 
