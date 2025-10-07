@@ -559,7 +559,7 @@ impl ColGenModel {
         for (id, _r) in self.data.requests.iter().enumerate() {
             self.subset_row_ineqs.push(self.model.add_constr(
                 &format!("ssi_{}", id),
-                c!(0.0 <= 1.0)
+                c!(0.0 <= INFINITY)
             ).unwrap());
         }
 
@@ -584,6 +584,24 @@ impl ColGenModel {
 
         for (cost, covered) in initial_routes.iter() {
             self.add_route_var(*cost as f64, covered.clone());
+        }
+    }
+
+    fn activate_sri_constraints(&mut self, verbose: bool) {
+        if verbose {
+            println!("Activating subset-row inequalities");
+        }
+        for c in self.subset_row_ineqs.iter() {
+            self.model.set_obj_attr(attr::RHS, c, 1.0).unwrap();
+        }
+    }
+
+    fn deactivate_sri_constraints(&mut self, verbose: bool) {
+        if verbose {
+            println!("Deactivating subset-row inequalities");
+        }
+        for c in self.subset_row_ineqs.iter() {
+            self.model.set_obj_attr(attr::RHS, c, INFINITY).unwrap();
         }
     }
 
@@ -818,10 +836,12 @@ impl ColGenModel {
                     },
                     LPSolvePhase::VehicleQuantity => {
                         mode = LPSolvePhase::VehicleCover;
+                        self.activate_sri_constraints(verbose);
                         println!("Adding coverage checks for vehicles");
                     },
                     LPSolvePhase::VehicleCover => {
                         mode = LPSolvePhase::CostNoCover;
+                        self.deactivate_sri_constraints(verbose);
                         println!("Optimal number of vehicles found after {} iterations", iter);
                         let obj = self.model.get_attr(attr::ObjVal).unwrap();
                         best_vehicle_count = obj.ceil() as usize;
@@ -853,6 +873,7 @@ impl ColGenModel {
                     },
                     LPSolvePhase::CostQuantity => {
                         mode = LPSolvePhase::CostCover;
+                        self.activate_sri_constraints(verbose);
                         println!("Adding coverage checks for costs");
                     },
                     LPSolvePhase::CostCover => {

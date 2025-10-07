@@ -2,4 +2,5 @@
 SkipsCutsNoD.py
 gurobi.log
 /scripts
+/logs
 /results
