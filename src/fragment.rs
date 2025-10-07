@@ -635,7 +635,7 @@ pub struct NodeContainer {
 pub struct ArcContainer {
     pub data: SPDPData,
     pub container: HashMap<(Node, Node, DoneSet), Vec<Arc>>,
-    pub arcs: Vec<Arc>,
+    arcs: Vec<Arc>,
     pub arcs_from: HashMap<Node, Vec<Arc>>,
     pub arcs_to: HashMap<Node, Vec<Arc>>,
     pub min_fragment_length: usize,
@@ -659,7 +659,15 @@ impl ArcContainer {
     }
 
     pub fn num_arcs(&self) -> usize {
-        self.arcs.len()
+        self.arcs.len() 
+    }
+
+    pub fn get_arcs(&self) -> Vec<&Arc> {
+        self.arcs.iter().collect()
+    }
+
+    pub fn get_arc(&self, i: usize) -> &Arc {
+        self.arcs.get(i).unwrap()   
     }
     
     fn create_arc(&mut self, start: Node, end: Node, done: DoneSet, path: Vec<Event>) {

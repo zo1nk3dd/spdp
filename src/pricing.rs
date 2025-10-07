@@ -1,5 +1,4 @@
-use core::{num, panic};
-use std::cmp::{min};
+use core::{panic};
 use std::collections::{HashMap};
 use std::fmt::Display;
 use std::time::{Duration, Instant};
@@ -54,7 +53,7 @@ impl VisitedData {
         }
     }
 
-    fn add_with_dominance_mode(&mut self, label: Label, mode: DominanceMode) -> bool {
+    fn _add_with_dominance_mode(&mut self, label: Label, mode: DominanceMode) -> bool {
         let mut new_label = label;
         new_label.id = self.labels.len(); // Set the label id to the current length of labels
         let bucket = &mut self.visited[label.node_id];
@@ -269,18 +268,18 @@ impl VisitedData {
         self.visited[node_id].values().flatten().map(|id| *id).collect()
     }
 
-    fn get_label_ids_by_node_covered(&self, node_id: usize, covered: &CoverSet) -> Vec<usize> {
-        let result = self.visited[node_id].get(&covered.covered);
-        if result.is_some() {
-            result.unwrap().clone()
-        } else {    
-            vec![]
-        }
-    }
+    // fn get_label_ids_by_node_covered(&self, node_id: usize, covered: &CoverSet) -> Vec<usize> {
+    //     let result = self.visited[node_id].get(&covered.covered);
+    //     if result.is_some() {
+    //         result.unwrap().clone()
+    //     } else {    
+    //         vec![]
+    //     }
+    // }
 
-    fn get_finished_labels(&self) -> Vec<Label> {
-        self.depot_labels.iter().map(|id| self.labels[*id]).collect()
-    }
+    // fn get_finished_labels(&self) -> Vec<Label> {
+    //     self.depot_labels.iter().map(|id| self.labels[*id]).collect()
+    // }
     
     fn print_visited_info(&self) {
         println!("Visited info:");
@@ -296,7 +295,7 @@ impl VisitedData {
 }
 
 pub trait Pricer {
-    fn solve_pricing_problem(&mut self, verbose: bool) -> Vec<Vec<Label>>;
+    fn solve_pricing_problem(&mut self, verbose: bool, objective: f64) -> Vec<Vec<Label>>;
 }
 
 
@@ -377,27 +376,38 @@ pub struct BucketPricer<'a> {
     graph: BucketGraph,
     cover_rc: Vec<f64>,
     vehicle_rc: Option<f64>,
+    ssi_duals: Vec<f64>,
     phase: LPSolvePhase,
     data: &'a SPDPData,
     arcs: &'a ArcContainer,
     nodes: &'a NodeContainer,
     visited: VisitedData,
+    pub lbs: Vec<f64>,
+    filter: &'a Option<Vec<bool>>,
 }
 
 impl<'a> BucketPricer<'a> {
-    pub fn new(data: &'a SPDPData, nodes: &'a NodeContainer, arcs: &'a ArcContainer, cover_rc: Vec<f64>, vehicle_rc: Option<f64>, phase: LPSolvePhase) -> Self {
+    pub fn new(data: &'a SPDPData, nodes: &'a NodeContainer, arcs: &'a ArcContainer, cover_rc: Vec<f64>, vehicle_rc: Option<f64>, ssi_duals: Vec<f64>, phase: LPSolvePhase, filter: &'a Option<Vec<bool>>) -> Self {
         let graph = BucketGraph::new(data.t_limit, arcs.min_fragment_length, nodes.nodes.len());
         let visited = VisitedData::new(nodes.nodes.len());
+        let lbs = vec![0.0; arcs.num_arcs()];
         BucketPricer {
             graph,
             cover_rc,
             vehicle_rc,
+            ssi_duals,
             phase,
             data,
             arcs,
             nodes,
             visited,
+            lbs,
+            filter,
         }
+    }
+
+    pub fn get_lbs(&self) -> Vec<f64> {
+        self.lbs.clone()
     }
 
     fn initialise_forward_labels(&mut self) {
@@ -505,6 +515,11 @@ impl<'a> BucketPricer<'a> {
     /// Extends a label by a given arc, creating a new label if the extension is valid.
     /// Set time limit to be the route time limit in the full forward modes, and half the timelimit for half passes.
     fn extend_label(&mut self, label: &Label, arc: &Arc, backward_pass_limit: usize) {   
+        if let Some(filter) = &self.filter {
+            if filter[arc.id] {
+                return; // Skip if the arc is filtered
+            }
+        }
         // Used for the half forward pass, dont extend labels past the time limit
         if let Some(next_label) = self.calculate_next_label(label, arc) {
             // Used for half backward pass, dont consider labels that exceed the backward pass limit
@@ -570,7 +585,61 @@ impl<'a> BucketPricer<'a> {
         }
     }
 
-    fn forward_backward_pass(&mut self, k: usize, verbose: bool) -> Vec<Vec<Label>> {
+    fn finished_label(&self, forward_label: &Label, backward_label: Option<&Label>, arc: Option<&Arc>) -> Option<Label> {
+        if arc.is_none() && backward_label.is_none() {
+            let mut new_label = forward_label.clone();
+            for (idx, &amount) in new_label.coverset.to_vec().iter().enumerate() {
+                if 2 * amount > self.data.requests[idx].quantity {
+                    new_label.reduced_cost -= self.ssi_duals[idx];
+                }
+            }
+        }
+
+        let mut new_label = if let Some(arc) = arc {
+            self.calculate_next_label(forward_label, arc)
+        } else {
+            Some(forward_label.clone())
+        }?;
+
+        if backward_label.is_none() {
+            // Look at the ssi duals
+            for (idx, &amount) in new_label.coverset.to_vec().iter().enumerate() {
+                if 2 * amount > self.data.requests[idx].quantity {
+                    new_label.reduced_cost -= self.ssi_duals[idx];
+                }
+            }
+            return Some(new_label);
+        }
+
+        let backward_label = backward_label.unwrap();
+
+        // Combine the coversets
+        let combined_coverset = new_label.coverset.combine(&backward_label.coverset);
+        if combined_coverset.is_err() {
+            return None; // Skip if the coversets are not compatible
+        }
+
+        new_label.coverset = combined_coverset.unwrap();
+
+        // Adjust the reduced cost
+        new_label.reduced_cost += backward_label.reduced_cost;
+        for (idx, &amount) in new_label.coverset.to_vec().iter().enumerate() {
+            if 2 * amount > self.data.requests[idx].quantity {
+                new_label.reduced_cost -= self.ssi_duals[idx];
+            }
+        }
+
+        new_label.cost += backward_label.cost;
+        new_label.duration += backward_label.duration;
+        
+        if new_label.duration > self.data.t_limit {
+            return None; // Skip if the new duration exceeds the time limit
+        }
+
+        Some(new_label)
+    }
+
+    fn forward_backward_pass(&mut self, k: usize, obj: f64, verbose: bool) -> Vec<Vec<Label>> {
         // Create the initial labels
         self.initialise_forward_labels();
         self.forward_pass((self.data.t_limit as f64 * FORWARD_BACKWARD_PASS_MARK) as usize);
@@ -597,19 +666,16 @@ impl<'a> BucketPricer<'a> {
         let depot_id = self.nodes.depot.id;
 
         for label_id in forward_pass_info.get_label_ids_by_node(depot_id) {
-            let forward_label = &forward_pass_info.labels[label_id];
-            if forward_label.reduced_cost < -EPS {
-                candidate_labels[depot_id].push(*forward_label);
+            if let Some(forward_label) = self.finished_label(&forward_pass_info.labels[label_id], None, None) {
+                if forward_label.reduced_cost < -EPS {
+                    candidate_labels[depot_id].push(forward_label);
+                }
             }
         }
-
-        
+  
         if candidate_labels[depot_id].len() > k {
             candidate_labels[depot_id].sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
             candidate_labels[depot_id].truncate(k); // Keep only the best k labels
-        }
-        else if candidate_labels[depot_id].is_empty() {
-            println!("No complete routes in forward pass");
         }
 
         for node_id in 1..self.nodes.nodes.len() {
@@ -624,25 +690,11 @@ impl<'a> BucketPricer<'a> {
 
             for forward_label in forward_bucket.iter() {
                 for backward_label in backward_bucket.iter() {
-                    if forward_label.reduced_cost + backward_label.reduced_cost >= worst_rc {
-                        break; // Skip if the combined reduced cost is not better
-                    }
-                    if forward_label.duration + backward_label.duration <= self.data.t_limit {
-                        let new_covered = forward_label.coverset.combine(&backward_label.coverset);
-                        if new_covered.is_ok() {
-                            // Create a new label combining forward and backward labels
-                            // Ensure the new label is not dominated by any existing label
-                            let candidate_label = Label::new(
-                            0,
-                                forward_label.reduced_cost + backward_label.reduced_cost,
-                                forward_label.duration + backward_label.duration,
-                                None,
-                                forward_label.cost + backward_label.cost,
-                                new_covered.unwrap(),
-                                0,
-                                0,
-                            );
-
+                    if let Some(candidate_label) = self.finished_label(forward_label, Some(backward_label), None) {
+                        if candidate_label.reduced_cost >= worst_rc {
+                            break; // Skip if the combined reduced cost is not better
+                        }
+                        if candidate_label.duration <= self.data.t_limit {
                             if !candidate_labels[node_id].iter().any(|l: &Label| l.dominates(&candidate_label, DominanceMode::DurRCCover)) {
                                 if candidate_labels[node_id].len() < k {
                                     candidate_labels[node_id].push(candidate_label);
@@ -665,17 +717,24 @@ impl<'a> BucketPricer<'a> {
                                     worst_rc = worst_cost; // Update the worst reduced cost
                                 }
                             }
-                        }  
+                        }
                     }
                 }
             }
         }
+
+        if candidate_labels.iter().flatten().all(|label| label.reduced_cost > -EPS) && (self.phase == LPSolvePhase::VehicleCover || self.phase == LPSolvePhase::CostCover) {
+            if verbose { println!("No candidate labels found in full coverage forward-backward pass"); }
+            // Store the lower bounds at this point to grab again later
+            let gap= if self.vehicle_rc.is_none() { obj - obj.floor() } else { obj * GAP_MULTIPLIER };
+            self.lbs = self.calculate_lower_rc_bounds_route_method(verbose, &forward_pass_info, &self.visited, gap);
+        }
         candidate_labels
     }
 
-    pub fn calculate_lower_rc_bounds_route_method(&mut self, verbose: bool, forward_pass_info: &VisitedData, backward_pass_info: &VisitedData, gap: f64) -> Vec<f64> {
+    fn calculate_lower_rc_bounds_route_method(&self, _verbose: bool, forward_pass_info: &VisitedData, backward_pass_info: &VisitedData, gap: f64) -> Vec<f64> {
         let maximum_reduced_cost = INFINITY;
-        let mut lbs = vec![maximum_reduced_cost; self.arcs.arcs.len()];
+        let mut lbs = vec![maximum_reduced_cost; self.arcs.num_arcs()];
         let mut feasible_routes = 0;
         let forward_labels_by_node: Vec<Vec<Label>> = self.nodes.nodes.iter()
             .map(|node| {
@@ -693,16 +752,18 @@ impl<'a> BucketPricer<'a> {
         
         // Depot nodes
         for label in forward_labels_by_node[self.nodes.depot.id].iter() {
-            if label.reduced_cost < gap {
-                feasible_routes += 1;
-                let lb = label.reduced_cost;
-                let mut curr = label;
-                loop {
-                    lbs[curr.in_arc] = lbs[curr.in_arc].min(lb);
-                    if curr.predecessor.is_none() {
-                        break;
+            if let Some(finished_label) = self.finished_label(label, None, None) {
+                if finished_label.reduced_cost < gap {
+                    feasible_routes += 1;
+                    let lb = finished_label.reduced_cost;
+                    let mut curr = label;
+                    loop {
+                        lbs[curr.in_arc] = lbs[curr.in_arc].min(lb);
+                        if curr.predecessor.is_none() {
+                            break;
+                        }
+                        curr = &forward_pass_info.labels[curr.predecessor.unwrap()];
                     }
-                    curr = &forward_pass_info.labels[curr.predecessor.unwrap()];
                 }
             }
         }
@@ -710,17 +771,9 @@ impl<'a> BucketPricer<'a> {
         for node in 1..self.nodes.nodes.len() {
             for forward_label in forward_labels_by_node[node].iter() {
                 for backward_label in backward_labels_by_node[node].iter() {
-                    if forward_label.duration + backward_label.duration > self.data.t_limit {
-                        continue;
-                    }
-                    let combined_rc = forward_label.reduced_cost + backward_label.reduced_cost;
-                    if combined_rc > gap {
-                        break; // Since backward labels are sorted by reduced cost, no need to check further
-                    }
-                    let new_covered = forward_label.coverset.combine(&backward_label.coverset);
-                    if new_covered.is_ok() {
+                    if let Some(finished_label) = self.finished_label(forward_label, Some(backward_label), None) {
                         feasible_routes += 1;
-                        let lb = combined_rc;
+                        let lb = finished_label.reduced_cost;
                         let mut curr = forward_label;
                         loop {
                             lbs[curr.in_arc] = lbs[curr.in_arc].min(lb);
@@ -737,6 +790,8 @@ impl<'a> BucketPricer<'a> {
                             }
                             curr = &backward_pass_info.labels[curr.predecessor.unwrap()];
                         }
+                    } else {
+                        continue;
                     }
                 }
             }
@@ -771,7 +826,7 @@ impl<'a> BucketPricer<'a> {
         self.calculate_lower_rc_bounds_route_method(verbose, &forward_pass_info, &backward_pass_info, gap)
     }
 
-    pub fn calculate_lower_rc_bounds_full_passes(&mut self, verbose: bool) -> HashMap<usize, f64> {
+    pub fn _calculate_lower_rc_bounds_full_passes(&mut self, verbose: bool) -> HashMap<usize, f64> {
         // Create the initial labels
         self.initialise_forward_labels();
         self.forward_pass(self.data.t_limit);
@@ -813,11 +868,6 @@ impl<'a> BucketPricer<'a> {
                     let index = num_buckets - (label.duration / width);
                     buckets[index].push(**label);
                 }
-                for bucket in buckets.iter() {
-                    // println!("Bucket size: {}", bucket.len());
-                    // println!(" Smallest duration: {}", bucket.iter().fold(500, |acc, label| acc.min(label.duration)));
-                    // println!(" Largest duration: {}", bucket.iter().fold(0, |acc, label| acc.max(label.duration)));
-                }
                 buckets            
             }).collect();
         
@@ -828,12 +878,12 @@ impl<'a> BucketPricer<'a> {
                 labels
             }).collect();
 
-        println!("Calculating lower bounds for {} arcs", self.arcs.arcs.len());
+        println!("Calculating lower bounds for {} arcs", self.arcs.num_arcs());
         let mut now = Instant::now();
         // Calculate the lowest reduced cost for every arc
         let (tx, rx) = std::sync::mpsc::channel();
         let mut handles = vec![];
-        for arc in self.arcs.arcs.iter() {
+        for arc in self.arcs.get_arcs() {
             if Instant::now() - now > Duration::from_secs(10) {
                 println!("Processed {} arcs", lower_bounds.len());
                 now = Instant::now();
@@ -894,7 +944,7 @@ impl<'a> BucketPricer<'a> {
     fn calculate_lower_bound_for_arc(arc: &Arc, forward_labels: Vec<Label>, backward_buckets: Vec<Vec<Label>>, arc_reduced_cost: f64, covered: CoverSet, t_limit: usize, min_fragment_length: usize, vehicle_rc: Option<f64>) -> f64 {
         let mut lowest_reduced_cost = INFINITY;
         if arc.start.id == 0 {
-            'backward: for (idx, backward_label) in backward_buckets.iter().flatten().enumerate() {
+            'backward: for (_idx, backward_label) in backward_buckets.iter().flatten().enumerate() {
                 if arc.time + backward_label.duration > t_limit {
                     continue; // Skip if the backward label exceeds the time limit
                 }
@@ -916,7 +966,7 @@ impl<'a> BucketPricer<'a> {
         }
 
         else if arc.end.id == 0 {
-            'forward: for (idx, forward_label) in forward_labels.iter().enumerate() {
+            'forward: for (_idx, forward_label) in forward_labels.iter().enumerate() {
                 if forward_label.duration + arc.time > t_limit {
                     continue; // Skip if the forward label exceeds the time limit
                 }
@@ -945,7 +995,7 @@ impl<'a> BucketPricer<'a> {
                 let arrive_time = arc.time + forward_label.duration;
                 let earliest_bucket = arrive_time / min_fragment_length;
                 'bucket: for backwards_bucket in backward_buckets.iter().skip(earliest_bucket) {
-                    'backward: for (bucket_idx, backward_label) in backwards_bucket.iter().enumerate() {
+                    'backward: for (_bucket_idx, backward_label) in backwards_bucket.iter().enumerate() {
                         let reduced_cost = forward_label.reduced_cost + backward_label.reduced_cost + arc_reduced_cost as f64;
                         if reduced_cost >= lowest_reduced_cost {
                             continue 'bucket; // Skip if the reduced cost is not lower
@@ -979,10 +1029,10 @@ impl<'a> BucketPricer<'a> {
 }
 
 impl Pricer for BucketPricer<'_> {  
-    fn solve_pricing_problem(&mut self, verbose: bool) -> Vec<Vec<Label>> {
+    fn solve_pricing_problem(&mut self, verbose: bool, objective: f64) -> Vec<Vec<Label>> {
         init_manager(self.data); // Cursed but necessary? It is what it is
 
-        let candidate_labels = self.forward_backward_pass(NUM_ROUTES_PER_NODE_CALCULATED, verbose);
+        let candidate_labels = self.forward_backward_pass(NUM_ROUTES_PER_NODE_CALCULATED, objective, verbose);
 
         candidate_labels
     }

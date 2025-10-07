@@ -1,3 +1,4 @@
+use spdp::constants::GAP_MULTIPLIER;
 use spdp::model::*;
 use spdp::utils::*;
 use std::env;
@@ -23,8 +24,8 @@ fn main() {
 
     let mut model = ColGenModel::new(data.clone());
 
-    let zlb = model.solve(verbose);
-    let mut zub = 1.01 * zlb; // Assuming a 10% upper bound for demonstration
+    let (zlb, vlb, v_guess, vehicle_lbs, cost_lbs) = model.solve(verbose);
+    let mut zub = GAP_MULTIPLIER * zlb; // Assuming a 10% upper bound for demonstration
 
 
     println!("Upper bound guess: {}", zub);
@@ -35,13 +36,15 @@ fn main() {
 
     println!("Time elapsed: {:?}", start.elapsed());
 
-    let lbs: Vec<f64> = model.get_lower_bounds(verbose, zub-zlb);
+    let v_gap = v_guess - vlb;
+
+    let vehicle_filter = vehicle_lbs.iter().map(|&lb| lb > v_gap).collect::<Vec<bool>>();
 
     let mut master = MasterProblemModel::new(data.clone(), model.arcs, model.nodes, v_count);
 
     loop {
-        master.filter_arcs(&lbs, zlb, zub);
-
+        let filter = vehicle_filter.iter().enumerate().map(|(idx, &b)| b || (cost_lbs[idx] > zub - zlb)).collect::<Vec<bool>>();
+        master.filter_arcs(filter);
         let result: Result<f64, grb::Error> = master.solve(verbose);
 
         match result {
@@ -50,20 +53,24 @@ fn main() {
                 println!("Objective value: {}", obj);
                 if obj > zub {
                     println!("Objective value exceeds upper bound guess. Updating upper bound.");
-                    zub = if obj > 1.01 * zub { 1.01 * zub } else { obj };
+                    zub = if obj > GAP_MULTIPLIER * zub { GAP_MULTIPLIER * zub } else { obj };
                     continue;
                 } else {
                     break;
                 }
             }
-            Err(e) => {
+            Err(_) => {
                 println!("Master problem is infeasible. Updating upper bound");
-                zub = 1.02 * zub;
+                zub = GAP_MULTIPLIER * zub;
                 continue;
             }
         }
     }
+    println!("CG vehicle soln: {}", vlb);
+    println!("CG cost soln: {}", zlb);
 
-    println!("Optimal objective value: {}", master.model.get_attr(grb::attr::ObjVal).unwrap());
+    let final_filter = vehicle_filter.iter().enumerate().map(|(idx, &b)| b || (cost_lbs[idx] > zub - zlb)).collect::<Vec<bool>>();
+
+    println!("Routes filtered: {} / {}", final_filter.iter().filter(|&&b| b).count(), final_filter.len());
+    println!("Time elapsed: {:?}", start.elapsed());
 }
-

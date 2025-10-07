@@ -158,8 +158,6 @@ pub fn init_manager(data: &SPDPData) -> &'static CoverSetManager {
 
 #[cfg(test)]
 mod tests {
-    use crate::coverset;
-
     use super::*;
 
     fn setup() {
