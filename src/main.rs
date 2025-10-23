@@ -1,7 +1,8 @@
-use spdp::constants::GAP_MULTIPLIER;
+use spdp::constants::EPS;
 use spdp::model::*;
 use spdp::utils::*;
 use std::env;
+use std::vec;
 
 fn main() {
     let start = std::time::Instant::now();
@@ -25,8 +26,10 @@ fn main() {
     let mut model = ColGenModel::new(data.clone());
 
     let (zlb, vlb, v_guess, vehicle_lbs, cost_lbs) = model.solve(verbose);
-    let mut zub = GAP_MULTIPLIER * zlb; // Assuming a 10% upper bound for demonstration
 
+    let mut route_ip: RouteIPModel = RouteIPModel::new(&data, &model.route_costs, &model.routes_covering_request, vlb.ceil() as usize);
+
+    let zub = route_ip.solve(verbose).unwrap();
 
     println!("Upper bound guess: {}", zub);
 
@@ -38,39 +41,49 @@ fn main() {
 
     let v_gap = v_guess - vlb;
 
-    let vehicle_filter = vehicle_lbs.iter().map(|&lb| lb > v_gap).collect::<Vec<bool>>();
+    println!(" Vehicle gap: {}", v_gap);
 
-    let mut master = MasterProblemModel::new(data.clone(), model.arcs, model.nodes, v_count);
+    let mut filter = vec![false; vehicle_lbs.len()];
+    
+    for (_idx, v_lb) in vehicle_lbs.iter().enumerate() {
+        if *v_lb > v_gap + EPS {
+            // filter[idx] = true;
+        }
+    }
+
+    let z_gap = zub - zlb;
+
+    println!(" Cost gap: {}", z_gap);
+
+    for (idx, cost_lb) in cost_lbs.iter().enumerate() {
+        if *cost_lb > z_gap + EPS {
+            filter[idx] = true;
+        }
+    }
+
+    println!(
+        "Filtered {:} / {} arcs before solving MP",
+        filter.iter().filter(|&&b| b).count(), filter.len()
+    );
+
+    let mut master = MasterProblemModel::new(data.clone(), model.arcs, model.nodes, v_count, filter.clone());
 
     loop {
-        let filter = vehicle_filter.iter().enumerate().map(|(idx, &b)| b || (cost_lbs[idx] > zub - zlb)).collect::<Vec<bool>>();
-        master.filter_arcs(filter);
-        let result: Result<f64, grb::Error> = master.solve(verbose);
+        let result: Result<f64, grb::Error> = master.solve(verbose, zlb, cost_lbs.clone());
 
-        match result {
+        match result {  
             Ok(obj) => {
                 // master.print_solution();
                 println!("Objective value: {}", obj);
-                if obj > zub {
-                    println!("Objective value exceeds upper bound guess. Updating upper bound.");
-                    zub = if obj > GAP_MULTIPLIER * zub { GAP_MULTIPLIER * zub } else { obj };
-                    continue;
-                } else {
-                    break;
-                }
+                break;
             }
             Err(_) => {
-                println!("Master problem is infeasible. Updating upper bound");
-                zub = GAP_MULTIPLIER * zub;
-                continue;
+                println!("Master problem is infeasible. ABORTING!?!?!?!?!");
+                panic!();
             }
         }
     }
     println!("CG vehicle soln: {}", vlb);
     println!("CG cost soln: {}", zlb);
-
-    let final_filter = vehicle_filter.iter().enumerate().map(|(idx, &b)| b || (cost_lbs[idx] > zub - zlb)).collect::<Vec<bool>>();
-
-    println!("Routes filtered: {} / {}", final_filter.iter().filter(|&&b| b).count(), final_filter.len());
     println!("Time elapsed: {:?}", start.elapsed());
 }

@@ -586,14 +586,14 @@ impl<'a> BucketPricer<'a> {
     }
 
     fn finished_label(&self, forward_label: &Label, backward_label: Option<&Label>, arc: Option<&Arc>) -> Option<Label> {
-        if arc.is_none() && backward_label.is_none() {
-            let mut new_label = forward_label.clone();
-            for (idx, &amount) in new_label.coverset.to_vec().iter().enumerate() {
-                if 2 * amount > self.data.requests[idx].quantity {
-                    new_label.reduced_cost -= self.ssi_duals[idx];
-                }
-            }
-        }
+        // if arc.is_none() && backward_label.is_none() {
+        //     let mut new_label = forward_label.clone();
+        //     for (idx, &amount) in new_label.coverset.to_vec().iter().enumerate() {
+        //         if 2 * amount > self.data.requests[idx].quantity {
+        //             new_label.reduced_cost -= self.ssi_duals[idx];
+        //         }
+        //     }
+        // }
 
         let mut new_label = if let Some(arc) = arc {
             self.calculate_next_label(forward_label, arc)
@@ -639,7 +639,7 @@ impl<'a> BucketPricer<'a> {
         Some(new_label)
     }
 
-    fn forward_backward_pass(&mut self, k: usize, obj: f64, verbose: bool) -> Vec<Vec<Label>> {
+    fn forward_backward_pass(&mut self, k: usize, _obj: f64, verbose: bool) -> Vec<Vec<Label>> {
         // Create the initial labels
         self.initialise_forward_labels();
         self.forward_pass((self.data.t_limit as f64 * FORWARD_BACKWARD_PASS_MARK) as usize);
@@ -726,16 +726,18 @@ impl<'a> BucketPricer<'a> {
         if candidate_labels.iter().flatten().all(|label| label.reduced_cost > -EPS) && (self.phase == LPSolvePhase::VehicleCover || self.phase == LPSolvePhase::CostCover) {
             if verbose { println!("No candidate labels found in full coverage forward-backward pass"); }
             // Store the lower bounds at this point to grab again later
-            let gap= if self.vehicle_rc.is_none() { obj - obj.floor() } else { obj * GAP_MULTIPLIER };
-            self.lbs = self.calculate_lower_rc_bounds_route_method(verbose, &forward_pass_info, &self.visited, gap);
+            self.lbs = self.calculate_lower_rc_bounds_route_method(verbose, &forward_pass_info, &self.visited);
         }
         candidate_labels
     }
 
-    fn calculate_lower_rc_bounds_route_method(&self, _verbose: bool, forward_pass_info: &VisitedData, backward_pass_info: &VisitedData, gap: f64) -> Vec<f64> {
-        let maximum_reduced_cost = INFINITY;
+    fn calculate_lower_rc_bounds_route_method(&self, _verbose: bool, forward_pass_info: &VisitedData, backward_pass_info: &VisitedData) -> Vec<f64> {
+
+        println!("\n\nCalculating lower RC bounds using route method\n\n");
+
+        let maximum_reduced_cost: f64 = 1e6;
         let mut lbs = vec![maximum_reduced_cost; self.arcs.num_arcs()];
-        let mut feasible_routes = 0;
+        let mut routes = 0;
         let forward_labels_by_node: Vec<Vec<Label>> = self.nodes.nodes.iter()
             .map(|node| {
                 let mut labels = forward_pass_info.get_label_ids_by_node(node.id).iter().map(|id| forward_pass_info.labels[*id].clone()).collect::<Vec<_>>();
@@ -753,17 +755,16 @@ impl<'a> BucketPricer<'a> {
         // Depot nodes
         for label in forward_labels_by_node[self.nodes.depot.id].iter() {
             if let Some(finished_label) = self.finished_label(label, None, None) {
-                if finished_label.reduced_cost < gap {
-                    feasible_routes += 1;
-                    let lb = finished_label.reduced_cost;
-                    let mut curr = label;
-                    loop {
-                        lbs[curr.in_arc] = lbs[curr.in_arc].min(lb);
-                        if curr.predecessor.is_none() {
-                            break;
-                        }
-                        curr = &forward_pass_info.labels[curr.predecessor.unwrap()];
+                routes += 1;
+                    
+                let lb = finished_label.reduced_cost;
+                let mut curr = label;
+                loop {
+                    lbs[curr.in_arc] = lbs[curr.in_arc].min(lb);
+                    if curr.predecessor.is_none() {
+                        break;
                     }
+                    curr = &forward_pass_info.labels[curr.predecessor.unwrap()];
                 }
             }
         }
@@ -772,7 +773,7 @@ impl<'a> BucketPricer<'a> {
             for forward_label in forward_labels_by_node[node].iter() {
                 for backward_label in backward_labels_by_node[node].iter() {
                     if let Some(finished_label) = self.finished_label(forward_label, Some(backward_label), None) {
-                        feasible_routes += 1;
+                        routes += 1;
                         let lb = finished_label.reduced_cost;
                         let mut curr = forward_label;
                         loop {
@@ -796,11 +797,11 @@ impl<'a> BucketPricer<'a> {
                 }
             }
         }
-        println!("Feasible routes found: {}", feasible_routes);
+        println!("Routes found: {}", routes);
         lbs
     }
 
-    pub fn calculate_lower_rc_bounds(&mut self, verbose: bool, gap: f64) -> Vec<f64> {
+    pub fn calculate_lower_rc_bounds(&mut self, verbose: bool) -> Vec<f64> {
         // Create the initial labels
         self.initialise_forward_labels();
         self.forward_pass((self.data.t_limit as f64 * FORWARD_BACKWARD_PASS_MARK) as usize);
@@ -823,7 +824,7 @@ impl<'a> BucketPricer<'a> {
             backward_pass_info.print_visited_info();
         }
 
-        self.calculate_lower_rc_bounds_route_method(verbose, &forward_pass_info, &backward_pass_info, gap)
+        self.calculate_lower_rc_bounds_route_method(verbose, &forward_pass_info, &backward_pass_info)
     }
 
     pub fn _calculate_lower_rc_bounds_full_passes(&mut self, verbose: bool) -> HashMap<usize, f64> {

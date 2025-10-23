@@ -1,6 +1,8 @@
 extern crate grb;
 
 use std::collections::HashSet;
+use grb::parameter::IntParam::BranchDir;
+use grb::parameter::IntParam::MIPFocus;
 use itertools::Itertools;
 
 use grb::attribute::ConstrDoubleAttr::RHS;
@@ -28,21 +30,74 @@ struct CallbackContext<'a> {
     nodes: &'a NodeContainer,
     arcs: &'a ArcContainer,
     x: &'a Vec<Vec<Var>>,
+    y: &'a Vec<Var>,
     verbose: bool,
+    cg_lb: f64,
+    best_rc_per_arc: Vec<f64>,
+    already_filtered: Vec<bool>,
+    prev_best_obj: f64,
 }
 
 impl<'a> CallbackContext<'a> {
-    fn new(data: &'a SPDPData, nodes: &'a NodeContainer, arcs: &'a ArcContainer, x: &'a Vec<Vec<Var>>, verbose: bool) -> Self {
+    fn new(data: &'a SPDPData, nodes: &'a NodeContainer, arcs: &'a ArcContainer, x: &'a Vec<Vec<Var>>, y: &'a Vec<Var>, verbose: bool, cg_lb: f64, best_rc_per_arc: Vec<f64>, already_filtered: Vec<bool>) -> Self {
         Self {
             data,
             nodes,
             arcs,
             x,
+            y,
             verbose,
+            cg_lb,
+            best_rc_per_arc,
+            already_filtered,
+            prev_best_obj: INFINITY,
         }
     }
 
     fn callback_mipsol(&mut self, ctx: MIPSolCtx) {
+        let obj = ctx.obj_best().unwrap();
+
+        // Add filtering cuts for arcs with reduced cost above (obj - cg_lb)
+        if obj < self.prev_best_obj {
+            let gap = obj - self.cg_lb;
+            let mut arcs_above_half = vec![];
+            for arc_id in 0..self.arcs.num_arcs() {
+                if self.best_rc_per_arc[arc_id] > gap + EPS && !self.already_filtered[arc_id] {
+                    for k in 0..self.x.len() {
+                        ctx.add_lazy(c!(self.x[k][arc_id] == 0.0)).unwrap();
+                    }
+                    self.already_filtered[arc_id] = true;
+                }
+
+                else if self.best_rc_per_arc[arc_id] > gap / 2.0 + EPS {
+                    arcs_above_half.push(arc_id);
+                }
+            }
+            if OVER_HALF_GAP_CUTS_ENABLED {
+                // Add big-M cuts for these arcs
+                for k in 0..self.x.len() {
+                    for arc in arcs_above_half.iter() {
+                        ctx.add_lazy(c!(self.x[k][*arc] <= self.y[k])).unwrap();
+                    }
+                }
+            }
+
+            if self.verbose {
+                println!("Added filtering cuts for arcs with reduced cost above {:.2}", obj - self.cg_lb);
+                println!("Filtered out {} arcs so far", self.already_filtered.iter().filter(|&&b| b).count());
+                let arcs_over_half = (0..self.arcs.num_arcs()).filter_map(|arc_id| {
+                    if self.best_rc_per_arc[arc_id] > (obj - self.cg_lb) / 2.0 && self.best_rc_per_arc[arc_id] < (obj - self.cg_lb) + EPS {
+                        Some(arc_id)
+                    } else {
+                        None
+                    }
+                }).count();
+                println!("Arcs over half the gap: {}", arcs_over_half);
+            }
+
+            self.prev_best_obj = obj;
+        }
+
         for (_, arcs) in self.x.iter().enumerate() {
             let soln = ctx.get_solution(arcs).unwrap();
             let mut sets: Vec<HashSet<usize>> = Vec::new();
@@ -153,6 +208,7 @@ pub struct MasterProblemModel {
     pub nodes: NodeContainer,
     pub model: Model,
     pub x: Vec<Vec<Var>>,
+    pub y: Vec<Var>,
     pub cover: Vec<Constr>,
     pub flow: Vec<Vec<Constr>>,
     pub time_lim: Vec<Constr>,
@@ -160,11 +216,14 @@ pub struct MasterProblemModel {
     pub sym_z: Vec<Constr>,
     pub a: Vec<Vec<f64>>,
     pub vehicle_limit: Constr,
+    pub filter_cuts: Vec<Constr>,
+    pub half_gap_cut: Constr,
+    pub already_filtered: Vec<bool>,
     pub single_request_symmetry: Vec<Constr>,
 }
 
 impl MasterProblemModel {
-    pub fn new(data: SPDPData, arc_container: ArcContainer, node_container: NodeContainer, vehicle_count: usize,) -> Self {
+    pub fn new(data: SPDPData, arc_container: ArcContainer, node_container: NodeContainer, vehicle_count: usize, vehicle_filter: Vec<bool>) -> Self {
 
         let mut model = Model::new("Master Problem").unwrap();
 
@@ -187,6 +246,10 @@ impl MasterProblemModel {
                 }).collect()
             })
             .collect();
+
+        let y: Vec<Var> = (0..vehicle_count).map(|vehicle_id| {
+            add_var!(model, Binary, name: &format!("y_{vehicle_id}"), obj: 0.0).unwrap()
+        }).collect();
 
         let z: Vec<Var> = (0..vehicle_count).map(|vehicle_id| {
             add_var!(model, Binary, name: &format!("z_{vehicle_id}"), obj: 0.0).unwrap()
@@ -393,6 +456,14 @@ impl MasterProblemModel {
             }
         }
 
+        let filter_cuts: Vec<Constr> = vec![
+            model.add_constr(&format!("Vehicle_filter"),
+                c!(vehicle_filter.iter().enumerate().filter_map(|(idx, &filtered)| if filtered { Some((0..vehicle_count).map(|k| x[k][idx]).grb_sum()) } else { None }).grb_sum() <= 0.0)
+            ).unwrap(),
+        ];
+
+        let half_gap_cut: Constr = model.add_constr(&format!("Half gap cut"), c!(y.iter().grb_sum() <= 1.0)).unwrap();
+
         Self {
             data,
             arcs: arc_container,
@@ -406,11 +477,15 @@ impl MasterProblemModel {
             sym_z,
             a,
             vehicle_limit,
+            y,
+            filter_cuts,
+            half_gap_cut,
+            already_filtered: vehicle_filter,
             single_request_symmetry
         }
     }
 
-    pub fn filter_arcs(&mut self, filter: Vec<bool>) {
+    pub fn _filter_arcs(&mut self, filter: Vec<bool>) {
         let mut filtered = 0;
 
         for (arc_id, &is_filtered) in filter.iter().enumerate() {
@@ -428,12 +503,14 @@ impl MasterProblemModel {
         println!("Filtered {}/{} arcs from the master problem", filtered, filter.len());
     }
 
-    pub fn solve(&mut self, verbose: bool) -> Result<f64, Error> {
+    pub fn solve(&mut self, verbose: bool, cg_lb: f64, best_rc_per_arc: Vec<f64>) -> Result<f64, Error> {
         self.model.set_attr(ModelSense, Minimize).unwrap();
         self.model.set_param(LazyConstraints, 1).unwrap();
-        let mut callback_context = CallbackContext::new(&self.data, &self.nodes, &self.arcs, &self.x, verbose);
+        self.model.set_param(BranchDir, 1).unwrap();
+        self.model.set_param(MIPFocus, 1).unwrap();
+        let mut callback_context = CallbackContext::new(&self.data, &self.nodes, &self.arcs, &self.x, &self.y, verbose, cg_lb, best_rc_per_arc, self.already_filtered.clone());
         self.model.optimize_with_callback(&mut callback_context).unwrap();
-
+        println!("% filtered: {:.4}", callback_context.already_filtered.iter().filter(|&&b| b).count() as f64 / callback_context.already_filtered.len() as f64);
         self.model.get_attr(attr::ObjVal)
     }
 
@@ -1117,3 +1194,71 @@ impl ColGenModel {
 //         assert!(result.is_ok());
 //     }
 // }
+
+pub struct RouteIPModel {
+    pub model: Model,
+    pub routes: Vec<Var>,
+    pub cover: Vec<Constr>,
+    pub vehicle_limit: Constr,
+    pub costs: Vec<f64>,
+    pub covered: Vec<Vec<usize>>,
+}
+
+impl RouteIPModel {
+    pub fn new(data: &SPDPData, route_costs: &Vec<f64>, routes_covering_request: &Vec<Vec<usize>>, max_vehicles: usize) -> Self {
+        let mut model = Model::new("Route IP Problem").unwrap();
+
+        let routes: Vec<Var> = route_costs.iter()
+            .enumerate()
+            .map(|(route_id, &cost)| {
+                add_var!(model, Integer, name: &format!("route_{}", route_id), obj: cost).unwrap()
+            })
+            .collect();
+
+        let cover: Vec<Constr> = data.requests.iter()
+            .enumerate()
+            .map(|(r_id, request)| {
+                let constr_expr = routes.iter()
+                    .zip(routes_covering_request[r_id].iter())
+                    .map(|(route_var, &amount)| (amount as f64 * *route_var))
+                    .grb_sum();
+
+                model.add_constr(
+                    &format!("request_{}", r_id),
+                    c!(constr_expr >= request.quantity as f64)
+                ).unwrap()
+            })
+            .collect();
+
+        let vehicle_limit = model.add_constr(
+            "vehicle_limit",
+            c!(routes.iter().grb_sum() <= max_vehicles as f64)
+        ).unwrap();
+
+        Self {
+            model,
+            routes,
+            cover,
+            vehicle_limit,
+            costs: route_costs.clone(),
+            covered: routes_covering_request.clone(),
+        }
+    }
+
+    pub fn solve(&mut self, verbose: bool) -> Result<f64, Error> {
+        if verbose {
+            println!("Solving Route IP Model with {} routes", self.routes.len());
+        }
+        self.model.set_attr(ModelSense, Minimize).unwrap();
+        self.model.optimize().unwrap();
+
+        for (idx, route) in self.routes.iter().enumerate() {
+            let value = self.model.get_obj_attr(X, route).unwrap();
+            if value < 0.0001 {
+                continue;
+            }
+            println!("Route variable: {:?}, cost: {:?}, covered: {:?}", route, self.costs[idx], (0..self.covered.len()).map(|r_id| self.covered[r_id][idx]).collect::<Vec<_>>());
+        }
+        self.model.get_attr(attr::ObjVal)
+    }
+}

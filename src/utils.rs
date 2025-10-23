@@ -331,8 +331,8 @@ impl Label {
 
 impl fmt::Display for Label {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "rc: {:.2}, d: {}, node: {:?}", 
-            self.reduced_cost, self.duration, self.node_id)
+        write!(f, "rc: {:.2}, c: {}, d: {}, node: {:?}, q: {:?}", 
+            self.reduced_cost, self.cost, self.duration, self.node_id, self.coverset.to_vec())
     }
 }
 
