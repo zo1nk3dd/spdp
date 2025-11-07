@@ -12,6 +12,7 @@ fn main() {
         println!("Usage: cargo run <instance> <--verbose>");
         return;
     }
+
     let instance = &args[1];
     let data = SPDPData::from_file(&format!("./SkipData/Benchmark/RecDep_day_{}.dat", instance));
 
@@ -19,17 +20,44 @@ fn main() {
     if args.len() == 3 && args[2] == "--verbose" {
         println!("Verbose mode enabled");
         verbose = true;
-    }
-
-    println!("Solving for the lower bound");
+    };
 
     let mut model = ColGenModel::new(data.clone());
 
-    let (zlb, vlb, v_guess, vehicle_lbs, cost_lbs) = model.solve(verbose);
+    let (mut zlb, vlb, mut v_guess, vehicle_lbs, mut cost_lbs) = model.solve(verbose);
+    let mut zub = f64::INFINITY;
 
-    let mut route_ip: RouteIPModel = RouteIPModel::new(&data, &model.route_costs, &model.routes_covering_request, vlb.ceil() as usize);
+    let mut best_sol: Vec<Vec<usize>> = Vec::new();
 
-    let zub = route_ip.solve(verbose).unwrap();
+    loop {
+        let mut route_ip: RouteIPModel = RouteIPModel::new(&data, &model.route_costs, &model.routes_covering_request, v_guess as usize);
+
+        let (result, route_sol) = route_ip.solve(verbose);
+
+        if result.is_ok() {
+            zub = result.unwrap();
+            println!("Upper bound found: {}", zub);
+            for (idx, obj) in route_sol.iter().enumerate() {
+                if *obj > EPS {
+                    best_sol.push(model.route_arcs[idx].clone());
+                }
+            }
+            break;
+        }
+
+        println!("Route IP infeasible, continuing column generation...");
+
+        (zlb, v_guess, cost_lbs) = model.solve_with_increased_vehicles(verbose, vlb, &vehicle_lbs);
+    }
+
+    // Extract the solution information
+    for (v_id, route) in best_sol.iter().enumerate() {
+        println!("Vehicle {}: Route {:?}", v_id + 1, route);
+        for &arc_id in route {
+            let arc = model.arcs.get_arc(arc_id);
+            println!("  Arc {}: from node {} to node {}", arc.id, arc.start.id, arc.end.id);
+        }
+    }
 
     println!("Upper bound guess: {}", zub);
 
@@ -43,9 +71,9 @@ fn main() {
 
     println!(" Vehicle gap: {}", v_gap);
 
-    let mut filter = vec![false; vehicle_lbs.len()];
+    let mut filter = vec![false; cost_lbs.len()];
     
-    for (_idx, v_lb) in vehicle_lbs.iter().enumerate() {
+    for (_idx, v_lb) in cost_lbs.iter().enumerate() {
         if *v_lb > v_gap + EPS {
             // filter[idx] = true;
         }
@@ -61,6 +89,10 @@ fn main() {
         }
     }
 
+    for arc_id in best_sol.iter().flatten() {
+        filter[*arc_id] = false;
+    }
+
     println!(
         "Filtered {:} / {} arcs before solving MP",
         filter.iter().filter(|&&b| b).count(), filter.len()
@@ -68,8 +100,10 @@ fn main() {
 
     let mut master = MasterProblemModel::new(data.clone(), model.arcs, model.nodes, v_count, filter.clone());
 
+    println!("Best solution so far: {:?}", best_sol);
+
     loop {
-        let result: Result<f64, grb::Error> = master.solve(verbose, zlb, cost_lbs.clone());
+        let result: Result<f64, grb::Error> = master.solve(verbose, zlb, cost_lbs.clone(), best_sol);
 
         match result {  
             Ok(obj) => {

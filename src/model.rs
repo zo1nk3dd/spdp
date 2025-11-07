@@ -1,8 +1,13 @@
 extern crate grb;
 
+use core::panic;
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::vec;
+use grb::attribute::VarDoubleAttr::Start;
 use grb::parameter::IntParam::BranchDir;
 use grb::parameter::IntParam::MIPFocus;
+use grb::parameter::IntParam::Threads;
 use itertools::Itertools;
 
 use grb::attribute::ConstrDoubleAttr::RHS;
@@ -194,7 +199,7 @@ impl callback::Callback for CallbackContext<'_> {
             Where::MIPSol(ctx) => {
                 // Handle MIP solution context
                 self.callback_mipsol(ctx);
-            }
+            },
             _ => {}
         }
         CbResult::Ok(())
@@ -209,6 +214,7 @@ pub struct MasterProblemModel {
     pub model: Model,
     pub x: Vec<Vec<Var>>,
     pub y: Vec<Var>,
+    pub z: Vec<Var>,
     pub cover: Vec<Constr>,
     pub flow: Vec<Vec<Constr>>,
     pub time_lim: Vec<Constr>,
@@ -357,7 +363,6 @@ impl MasterProblemModel {
             }).collect();
 
         // Subset-row
-
         let _basic_odd_requests: Vec<Constr> = data.requests.iter().enumerate()
             .filter(|(_r_id, r)| r.quantity % 2 == 1 || r.quantity > 2)
             .map(|(r_id, r)| {
@@ -458,8 +463,8 @@ impl MasterProblemModel {
 
         let filter_cuts: Vec<Constr> = vec![
             model.add_constr(&format!("Vehicle_filter"),
-                c!(vehicle_filter.iter().enumerate().filter_map(|(idx, &filtered)| if filtered { Some((0..vehicle_count).map(|k| x[k][idx]).grb_sum()) } else { None }).grb_sum() <= 0.0)
-            ).unwrap(),
+                c!(vehicle_filter.iter().enumerate().filter_map(|(idx, &filtered)| if filtered { Some((0..vehicle_count).map(|k| x[k][idx]).grb_sum()) } else { None }).grb_sum() == 0.0)
+            ).unwrap()
         ];
 
         let half_gap_cut: Constr = model.add_constr(&format!("Half gap cut"), c!(y.iter().grb_sum() <= 1.0)).unwrap();
@@ -470,6 +475,8 @@ impl MasterProblemModel {
             nodes: node_container,
             model,
             x,
+            y,
+            z,
             cover,
             flow,
             time_lim,
@@ -477,7 +484,6 @@ impl MasterProblemModel {
             sym_z,
             a,
             vehicle_limit,
-            y,
             filter_cuts,
             half_gap_cut,
             already_filtered: vehicle_filter,
@@ -503,11 +509,295 @@ impl MasterProblemModel {
         println!("Filtered {}/{} arcs from the master problem", filtered, filter.len());
     }
 
-    pub fn solve(&mut self, verbose: bool, cg_lb: f64, best_rc_per_arc: Vec<f64>) -> Result<f64, Error> {
+    pub fn solve(&mut self, verbose: bool, cg_lb: f64, best_rc_per_arc: Vec<f64>, best_sol: Vec<Vec<usize>>) -> Result<f64, Error> {
         self.model.set_attr(ModelSense, Minimize).unwrap();
         self.model.set_param(LazyConstraints, 1).unwrap();
         self.model.set_param(BranchDir, 1).unwrap();
         self.model.set_param(MIPFocus, 1).unwrap();
+        self.model.set_param(Threads, 16).unwrap();
+
+        let mut route_cover: Vec<Vec<usize>> = vec![vec![0; self.data.num_requests]; self.x.len()];
+
+        // Turn the vectors of arc_ids in best_sol to (arc_id, count) pairs
+        let mut arc_counts: Vec<Vec<(usize, usize)>> = best_sol.iter().enumerate().map(|(vehicle_id, arc_ids)| {
+            let mut counts = HashMap::new();
+            for &arc_id in arc_ids {
+                *counts.entry(arc_id).or_insert(0) += 1;
+                for r_id in 0..self.data.num_requests {
+                    route_cover[vehicle_id][r_id] += self.a[r_id][arc_id] as usize;
+                }
+            }
+            counts.into_iter().collect::<Vec<_>>()
+        }).collect();
+
+        if verbose { println!("Initial coverage per vehicle: {:?}", route_cover); }
+
+        let mut coverage: Vec<usize> = vec![0; self.data.num_requests];
+
+        // Are any requests over covered?
+        arc_counts = arc_counts.iter().map(|route_arcs| {
+            route_arcs.iter().filter_map(|(arc_id, count)| {
+                let done = self.arcs.get_arc(*arc_id).done;
+                if done.len() == 0 {
+                    return Some((*arc_id, *count));
+                }
+                coverage[done.left()] += count;
+                if coverage[done.left()] > self.data.requests[done.left()].quantity {
+                    // Overcovered
+                    coverage[done.left()] -= count;
+                    if verbose { println!("Request {} is overcovered", done.left()); }
+                    return None
+                }
+                if done.len() == 2 {
+                    coverage[done.right()] += count;
+                    if coverage[done.right()] > self.data.requests[done.right()].quantity {
+                        // Overcovered
+                        coverage[done.left()] -= count;
+                        coverage[done.right()] -= count;
+                        if verbose { println!("Request {} is overcovered", done.right()); }
+                        return None
+                    }
+                }
+                Some((*arc_id, *count))
+            }).collect()
+        }).collect::<Vec<Vec<(usize, usize)>>>();
+
+        if verbose {
+            // Clauclate the coverage per vehicle again
+            let mut new_route_cover: Vec<Vec<usize>> = vec![vec![0; self.data.num_requests]; self.x.len()];
+            for (vehicle_id, route_arcs) in arc_counts.iter().enumerate() {
+                for (arc_id, count) in route_arcs.iter() {
+                    for r_id in 0..self.data.num_requests {
+                        new_route_cover[vehicle_id][r_id] += self.a[r_id][*arc_id] as usize * *count;
+                    }
+                }
+            }
+            println!("Adjusted coverage per vehicle: {:?}", new_route_cover);
+        }
+
+        let mut add_back = vec![0; self.data.num_requests];
+        for r_id in 0..self.data.num_requests {
+            if coverage[r_id] < self.data.requests[r_id].quantity {
+                add_back[r_id] = self.data.requests[r_id].quantity - coverage[r_id];
+                if verbose { println!("Request {} is undercovered by {}", r_id, add_back[r_id]); }
+            }
+        }
+
+        // Turn the invalid routes into valid ones. These are the routes that have changed
+        for route in arc_counts.iter_mut() {
+            let mut start_locs = Vec::new();
+            let mut end_locs = Vec::new();
+            for (arc_id, _) in route.iter() {
+                let arc = self.arcs.get_arc(*arc_id);
+                start_locs.push(arc.start.id);
+                end_locs.push(arc.end.id);
+            }
+            if verbose {
+                println!("Scanning route: starting locations {:?}, ending locations {:?}", start_locs, end_locs);
+            }
+            start_locs = start_locs.into_iter().filter(|&loc| {
+                // Remove this location from the end locations
+                if let Some(pos) = end_locs.iter().position(|&x| x == loc) {
+                    end_locs.remove(pos);
+                    false
+                } else {
+                    true
+                }
+            }).collect();
+
+            // The remaining locations are the problematic ones
+            // Do we need to add any requests back???
+            loop {
+                let end_loc = end_locs.pop();
+                let start_loc = start_locs.pop();
+                if verbose {
+                    println!("Fixing route: going from start {:?} to end {:?}", start_loc, end_loc);
+                }
+                if end_loc.is_none() && start_loc.is_none() {
+                    break;
+                }
+                else if end_loc.is_none() || start_loc.is_none() {
+                    println!("Start: {:?}\nEnd: {:?}", start_locs, end_locs);
+                    panic!("Mismatched start and end locations");
+                }
+
+                if add_back.iter().all(|&x| x == 0) {
+                    // Find the arc ending at end_loc
+                    let remove_idx = route.iter().position(|(arc_id, _)| {
+                        let arc = self.arcs.get_arc(*arc_id);
+                        arc.end.id == end_loc.unwrap()
+                    }).unwrap();
+                    let to_remove = self.arcs.get_arc(route[remove_idx].0);
+                    if route[remove_idx].1 > 1 {
+                        route[remove_idx].1 -= 1;
+                    } else {
+                        route.remove(remove_idx);
+                    }
+                    // Find an arc, covering the same as the remove arc that starts at the same place and ends at start loc
+                    let new_arc = self.arcs.arcs_from.get(&to_remove.start).unwrap().iter().find(|arc| arc.end.id == start_loc.unwrap() && arc.done == to_remove.done);
+                    if new_arc.is_none() {
+                        println!("Could not find replacement arc for arc {}", to_remove.id);
+                    } else {
+                        route.push((new_arc.unwrap().id, 1));
+                        if verbose {
+                            println!("Replaced arc {} with arc {:?}", to_remove.id, new_arc.unwrap());
+                        }
+                    }
+                } else if add_back.iter().sum::<usize>() == 1 {
+                    let new_arc = self.arcs.arcs_from.get(&self.nodes.nodes.get(end_loc.unwrap()).unwrap()).unwrap().iter().find(|arc| {
+                        arc.end.id == start_loc.unwrap() && arc.done.len() == 1 && add_back[arc.done.left()] > 0
+                    });
+                    if new_arc.is_none() {
+                        println!("Could not find replacement arc from {} to {} to add back request", start_loc.unwrap(), end_loc.unwrap());
+                    } else {
+                        route.push((new_arc.unwrap().id, 1));
+                        if verbose {
+                            println!("Added back request {} using arc {}", new_arc.unwrap().done.left(), new_arc.unwrap().id);
+                        }
+                    }
+                } else {
+                    let new_arc = self.arcs.arcs_from.get(&self.nodes.nodes.get(end_loc.unwrap()).unwrap()).unwrap().iter().find(|arc| {
+                        arc.end.id == start_loc.unwrap() && arc.done.len() > 1 && add_back[arc.done.left()] > 0 && add_back[arc.done.right()] > 0
+                    });
+                    if new_arc.is_none() {
+                        println!("Could not find replacement arc from {} to {} to add back request", start_loc.unwrap(), end_loc.unwrap());
+                    } else {
+                        route.push((new_arc.unwrap().id, 1));
+                        if verbose {
+                            println!("Added back requests {} and {} using arc {}", new_arc.unwrap().done.left(), new_arc.unwrap().done.right(), new_arc.unwrap().id);
+                        }
+                    }
+                }
+            }
+        }
+
+        while add_back.iter().sum::<usize>() > 0 {
+            if verbose { println!("Warning: could not add back all missing requests, remaining {:?}", add_back); }
+            // Find the shortest route and add them there
+
+            let route_lengths: Vec<usize> = arc_counts.iter().map(|route| {
+                route.iter().map(|(arc_id, count)| {
+                    let arc = self.arcs.get_arc(*arc_id);
+                    arc.time * *count
+                }).sum()
+            }).collect();
+
+            let shortest_route = &mut arc_counts[route_lengths.iter().position(|&len| len == *route_lengths.iter().min().unwrap()).unwrap()];
+
+            let last_arc_idx = shortest_route.iter().position(|(arc, _)| self.arcs.get_arc(*arc).end == self.nodes.depot).unwrap();
+            let last_arc = self.arcs.get_arc(shortest_route[last_arc_idx].0);
+
+            for arc in self.arcs.arcs_to.get(&self.nodes.depot).unwrap() {
+                if arc.done.len() == 2 && add_back[arc.done.left()] > 0 && add_back[arc.done.right()] > 0 {
+                    // Add this arc
+                    shortest_route.push((arc.id, 1));
+                    add_back[arc.done.left()] -= 1;
+                    add_back[arc.done.right()] -= 1;
+                    if verbose {
+                        println!("Added back requests {} and {} using arc {:?}", arc.done.left(), arc.done.right(), arc);
+                    }
+                    // Add the arc that connects this from the previous one
+                    let connecting_arc = self.arcs.arcs_from.get(&last_arc.start).unwrap().iter().find(|a| a.end == arc.start && a.done == last_arc.done);
+                    if connecting_arc.is_none() {
+                        println!("Could not find connecting arc from {} to {}", last_arc.start.id, arc.start.id);
+                    } else {
+                        shortest_route.push((connecting_arc.unwrap().id, 1));
+                        if verbose {
+                            println!("Added connecting arc {:?} from {} to {}", connecting_arc.unwrap(), connecting_arc.unwrap().start.id, connecting_arc.unwrap().end.id);
+                        }
+                    }
+                    shortest_route.remove(last_arc_idx);
+                    break;
+                } else if arc.done.len() == 1 && add_back[arc.done.left()] > 0 {
+                    // Add this arc
+                    shortest_route.push((arc.id, 1));
+                    add_back[arc.done.left()] -= 1;
+                    if verbose {
+                        println!("Added back request {} using arc {:?}", arc.done.left(), arc);
+                    }
+                    // Add the arc that connects this from the previous one
+                    let connecting_arc = self.arcs.arcs_from.get(&last_arc.start).unwrap().iter().find(|a| a.end == arc.start && a.done == last_arc.done);
+                    if connecting_arc.is_none() {
+                        println!("Could not find connecting arc from {} to {}", last_arc.start.id, arc.start.id);
+                    } else {
+                        shortest_route.push((connecting_arc.unwrap().id, 1));
+                        if verbose {
+                            println!("Added connecting arc {:?} from {} to {}", connecting_arc.unwrap(), connecting_arc.unwrap().start.id, connecting_arc.unwrap().end.id);
+                        }
+                    }
+                    shortest_route.remove(last_arc_idx);
+                    break;
+                }
+            }
+
+        }
+
+        // Double check coverage
+        let mut final_coverage: Vec<usize> = vec![0; self.data.num_requests];
+        for route in arc_counts.iter() {
+            for (arc_id, count) in route.iter() {
+                for r_id in 0..self.data.num_requests {
+                    final_coverage[r_id] += self.a[r_id][*arc_id] as usize * count;
+                }
+            }
+        }
+        for r_id in 0..self.data.num_requests {
+            if verbose && final_coverage[r_id] != self.data.requests[r_id].quantity {
+                println!("Final coverage for request {} is {}, expected {}", r_id, final_coverage[r_id], self.data.requests[r_id].quantity);
+            }
+        }
+
+        // Display the routes
+        if verbose {
+            for (v_id, route) in arc_counts.iter().enumerate() {
+                println!("Vehicle {}: Route {:?}", v_id + 1, route);
+                for (arc_id, count) in route.iter() {
+                    let arc = self.arcs.get_arc(*arc_id);
+                    println!("  Arc {}: from node {} to node {} (count {})", arc.id, arc.start.id, arc.end.id, count);
+                }
+            }
+        }
+
+        // We need to give request 0 to the first vehicle, request 1 to the one of the first two, etc. to satisfy the symmetry constraints
+
+        let num_vehicles = best_sol.len();
+        let mut vehicle_to_be_assigned = 0;
+        let mut assigned_route = num_vehicles;
+
+        for r_id in 0..num_vehicles {
+            for (idx, route) in arc_counts.iter().enumerate() {
+                for (arc_id, _) in route.iter() {
+                    if self.a[r_id][*arc_id] > 0.0 {
+                        assigned_route = idx;
+                    }
+                }
+            }
+            if assigned_route < num_vehicles {
+                // Assign this route to vehicle r_id
+                for (arc_id, count) in arc_counts[assigned_route].iter() {
+                    if verbose {
+                        println!("Assigning arc {} (count {}) to vehicle {}", arc_id, count, vehicle_to_be_assigned);
+                    }
+                    self.model.set_obj_attr(Start, &self.x[vehicle_to_be_assigned][*arc_id], *count as f64).unwrap();
+                }
+                // Remove this route from consideration
+                arc_counts.remove(assigned_route);
+                assigned_route = num_vehicles;
+                vehicle_to_be_assigned += 1;
+            }
+        }
+
+        for route in arc_counts.iter() {
+            for (arc_id, count) in route.iter() {
+                if verbose {
+                    println!("Assigning arc {} (count {}) to vehicle {}", arc_id, count, vehicle_to_be_assigned);
+
+                }
+                self.model.set_obj_attr(Start, &self.x[vehicle_to_be_assigned][*arc_id], *count as f64).unwrap();
+            }
+            vehicle_to_be_assigned += 1;
+        }
+
         let mut callback_context = CallbackContext::new(&self.data, &self.nodes, &self.arcs, &self.x, &self.y, verbose, cg_lb, best_rc_per_arc, self.already_filtered.clone());
         self.model.optimize_with_callback(&mut callback_context).unwrap();
         println!("% filtered: {:.4}", callback_context.already_filtered.iter().filter(|&&b| b).count() as f64 / callback_context.already_filtered.len() as f64);
@@ -536,6 +826,7 @@ pub struct ColGenModel {
     pub routes_covering_request: Vec<Vec<usize>>,
     pub lambda: Vec<Var>,
     pub route_costs: Vec<f64>,
+    pub route_arcs: Vec<Vec<usize>>,
     pub cover_constraints: Vec<Constr>,
     pub vehicle_constraint: Option<Constr>,
     pub max_vehicles: Option<usize>,
@@ -561,6 +852,7 @@ impl ColGenModel {
             routes_covering_request: vec![Vec::new(); data.num_requests],
             lambda: Vec::new(),
             route_costs: Vec::new(),
+            route_arcs: Vec::new(),
             cover_constraints: Vec::new(),
             vehicle_constraint: None,
             max_vehicles: None,
@@ -573,7 +865,7 @@ impl ColGenModel {
         result
     }
 
-    pub fn add_route_var(&mut self, cost: f64, covered: Vec<usize>) {
+    pub fn add_route_var(&mut self, cost: f64, covered: Vec<usize>, arcs: Vec<usize>) {
         // Add a new route to the model
         let route_id = self.lambda.len();
 
@@ -616,6 +908,7 @@ impl ColGenModel {
 
         self.lambda.push(lambda);
         self.route_costs.push(cost);
+        self.route_arcs.push(arcs);
     }
 
     pub fn initialise_model_constraints(&mut self) {
@@ -644,7 +937,7 @@ impl ColGenModel {
     }
 
     pub fn first_initialisation(&mut self) {
-        let mut initial_routes: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut initial_routes: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
         for arc in self.arcs.get_arcs() {
             if arc.start.is_pickup() && arc.end.is_depot() {
                 let mut covered = vec![0; self.data.num_requests];
@@ -655,12 +948,16 @@ impl ColGenModel {
                     covered[arc.done.right()] += 1;
                 }
 
-                initial_routes.push((arc.cost + self.data.fixed_vehicle_cost, covered));
+                let mut route_arcs = vec![arc.id];
+
+                route_arcs.push(self.arcs.arcs_from.get(&self.nodes.depot).unwrap().iter().find(|depot_arc: &&Arc| depot_arc.end.id == arc.start.id).map(|depot_arc| depot_arc.id).unwrap());
+
+                initial_routes.push((arc.cost + self.data.fixed_vehicle_cost, covered, route_arcs));
             }
         }
 
-        for (cost, covered) in initial_routes.iter() {
-            self.add_route_var(*cost as f64, covered.clone());
+        for (cost, covered, route_arcs) in initial_routes.iter() {
+            self.add_route_var(*cost as f64, covered.clone(), route_arcs.clone());
         }
     }
 
@@ -696,6 +993,194 @@ impl ColGenModel {
         }
     }
 
+    pub fn solve_with_increased_vehicles(&mut self, verbose: bool, vlb: f64, vehicle_lbs: &Vec<f64>) -> (f64, f64, Vec<f64>) {
+        // Increase the vehicle limit by 1 and solve
+        if self.max_vehicles.is_none() {
+            panic!("Vehicle constraint is not set");
+        } else {
+            self.max_vehicles = Some(self.max_vehicles.unwrap() + 1);
+        }
+
+        self.model.set_obj_attr(RHS, &self.vehicle_constraint.as_ref().unwrap(), (self.max_vehicles.unwrap()) as f64).unwrap();
+
+        let vehicle_filter = Some(vehicle_lbs.iter().map(|&lb| lb >= self.max_vehicles.unwrap() as f64 - vlb + EPS).collect::<Vec<bool>>());
+        let mut cost_lbs = vec![];
+        let mut route_pool: Vec<(Label, Vec<usize>)> = vec![];
+        let mut mode = LPSolvePhase::CostNoCover;
+        self.deactivate_sri_constraints(verbose);
+
+        loop {
+            self.model.update().unwrap();
+            self.model.optimize().unwrap();
+
+            let mut new_routes: Vec<(Label, Vec<usize>)> = Vec::new();
+            let obj = self.model.get_attr(attr::ObjVal).unwrap();
+            println!("OBJVAL: {:?}", obj);
+            let cover_duals = self.cover_constraints.iter()
+                .map(|c| self.model.get_obj_attr(attr::Pi, c).unwrap())
+                .collect::<Vec<_>>();
+
+            let vehicle_dual = if self.max_vehicles.is_some() {
+                Some(self.model.get_obj_attr(attr::Pi, self.vehicle_constraint.as_ref().unwrap()).unwrap())
+            } else {
+                None
+            };
+
+            let ssi_duals = self.subset_row_ineqs.iter()
+                .map(|c| self.model.get_obj_attr(attr::Pi, c).unwrap())
+                .collect::<Vec<_>>();
+
+            if verbose {
+                println!("Cover duals: {:?}", cover_duals);
+                if let Some(dual) = vehicle_dual {
+                    println!("Vehicle dual: {:?}", dual);
+                }
+                println!("SSI duals: {:?}", ssi_duals);
+            }
+
+            // Check the route pool for any candidate routes
+
+            for (label, visited) in route_pool.iter() {
+                let reduced_cost = match mode {
+                    LPSolvePhase::VehicleNoCover | LPSolvePhase::VehicleCover | LPSolvePhase::VehicleQuantity=> {
+                        panic!("Should not be in vehicle phase");
+                    },
+                    LPSolvePhase::CostNoCover | LPSolvePhase::CostCover | LPSolvePhase::CostQuantity => {
+                        label.cost as f64
+                            - label.coverset.to_vec().iter().enumerate()
+                                .map(|(idx, amount)| *amount as f64 * cover_duals[idx])
+                                .sum::<f64>()
+                            - vehicle_dual.unwrap_or(0.0)
+                            - label.coverset.to_vec().iter().enumerate()
+                                .map(|(idx, amount)| {
+                                    if 2 * amount > self.data.requests[idx].quantity {
+                                        ssi_duals[idx]
+                                    } else {
+                                        0.0
+                                    }
+                                })
+                                .sum::<f64>()
+                    },
+                };
+
+                if reduced_cost < -EPS {
+                    if verbose {
+                        println!("Route from pool with reduced cost: {:.4}", reduced_cost);
+                    }
+                    new_routes.push((Label {
+                        id: label.id,
+                        reduced_cost,
+                        duration: label.duration,
+                        predecessor: label.predecessor,
+                        cost: label.cost,
+                        coverset: label.coverset,
+                        node_id: label.node_id,
+                        in_arc: label.in_arc,
+                    }, visited.clone()));
+                }
+            }
+
+            if !new_routes.is_empty() {
+                if verbose {
+                    println!("Found {} candidate routes in the pool", new_routes.len());
+                    new_routes.sort_by(|a, b| a.0.reduced_cost.partial_cmp(&b.0.reduced_cost).unwrap());
+                    new_routes.truncate(NUM_ROUTES_PER_NODE_ADDED * self.nodes.nodes.len());
+                    // panic!("Candidate routes found in the pool, not implemented yet");
+                }
+            } else {
+                if verbose {
+                    println!("No candidate routes found in the pool");
+                }
+
+                let mut pricer = BucketPricer::new(
+                    &self.data,
+                    &self.nodes,
+                    &self.arcs,
+                    cover_duals,
+                    vehicle_dual,
+                    ssi_duals,
+                    mode,
+                    &vehicle_filter,
+                );
+
+                let mut candidates: Vec<Vec<(Label, Vec<usize>)>> = pricer.solve_pricing_problem(verbose, obj);
+
+                for node_id in 0..self.nodes.nodes.len() {
+                    let node_routes = &mut candidates[node_id];
+
+                    node_routes.sort_by(|a, b| a.0.reduced_cost.partial_cmp(&b.0.reduced_cost).unwrap());
+
+                    for i in 0..NUM_ROUTES_PER_NODE_ADDED {
+                        let label = if i < node_routes.len() {
+                            &node_routes[i]
+                        } else {
+                            break;
+                        };
+
+                        if label.0.reduced_cost <= -EPS {
+                            new_routes.push(label.clone());
+                        } else {
+                            route_pool.push(label.clone());
+                        }
+                    }
+
+                    for i in NUM_ROUTES_PER_NODE_ADDED..NUM_ROUTES_PER_NODE_CALCULATED {
+                        if i < node_routes.len() {
+                            let (label, visited) = &node_routes[i];
+                            route_pool.push((label.clone(), visited.clone()));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if new_routes.is_empty() {
+                    if mode == LPSolvePhase::CostCover {
+                        cost_lbs = pricer.get_lbs();
+                    }
+                }
+            }
+
+            if new_routes.is_empty() {
+                println!("No new routes found");
+
+                match mode {
+                    LPSolvePhase::VehicleNoCover | LPSolvePhase::VehicleQuantity | LPSolvePhase::VehicleCover => {
+                        panic!("Should not be in vehicle phase");
+                    },
+                    LPSolvePhase::CostNoCover => {
+                        mode = LPSolvePhase::CostQuantity;
+                        println!("Adding quantity checks for costs");
+                    },
+                    LPSolvePhase::CostQuantity => {
+                        mode = LPSolvePhase::CostCover;
+                        self.activate_sri_constraints(verbose);
+                        println!("Adding coverage checks for costs");
+                    },
+                    LPSolvePhase::CostCover => {
+                        // Successfully solved the second phase of the problem
+                        println!("Optimal obj {} found", self.model.get_attr(ObjVal).unwrap());
+
+                        return (self.model.get_attr(attr::ObjVal).unwrap(), self.max_vehicles.unwrap() as f64, cost_lbs);
+                    },
+                }
+            }
+
+            else {         
+                println!("Adding {} new routes", new_routes.len());
+                let raw_ref: *mut ColGenModel = self;
+                for (route, visited) in new_routes.iter() {
+                    let cost = route.cost as f64;
+                    let covered = route.coverset.to_vec();
+                    let reduced_cost = route.reduced_cost;
+                    unsafe {
+                        raw_ref.as_mut().unwrap().add_route_var(cost, covered, visited.clone());
+                    }
+                    if verbose { println!("COST: {}, RC: {:.4}, COVER: {:?}", cost, reduced_cost, route.coverset.to_vec()); }
+                }
+            }
+        }
+    }
+
     /// Solves the column generation model
     /// # Arguments
     /// * `verbose` - If true, prints detailed information about the solving process
@@ -711,7 +1196,7 @@ impl ColGenModel {
 
         let mut mode = LPSolvePhase::VehicleNoCover;
 
-        let mut route_pool: Vec<Label> = Vec::new();
+        let mut route_pool: Vec<(Label, Vec<usize>)> = Vec::new();
 
         let mut vlb = 0.0;
     
@@ -736,7 +1221,7 @@ impl ColGenModel {
                 }
             }
 
-            let mut new_routes: Vec<Label> = Vec::new();            
+            let mut new_routes: Vec<(Label, Vec<usize>)> = Vec::new();
             let obj = self.model.get_attr(attr::ObjVal).unwrap();
             println!("OBJVAL: {:?}", obj);
             if self.vehicle_constraint.is_none() && obj - EPS < 1.0 {
@@ -787,7 +1272,7 @@ impl ColGenModel {
 
                 // Check the route pool for any candidate routes
 
-                for label in route_pool.iter() {
+                for (label, visited) in route_pool.iter() {
                     let reduced_cost = match mode {
                         LPSolvePhase::VehicleNoCover | LPSolvePhase::VehicleCover | LPSolvePhase::VehicleQuantity=> {
                             1.0 - label.coverset.to_vec().iter().enumerate()
@@ -825,7 +1310,7 @@ impl ColGenModel {
                         if verbose {
                             println!("Route from pool with reduced cost: {:.4}", reduced_cost);
                         }
-                        new_routes.push(Label {
+                        new_routes.push((Label {
                             id: label.id,
                             reduced_cost,
                             duration: label.duration,
@@ -834,14 +1319,14 @@ impl ColGenModel {
                             coverset: label.coverset,
                             node_id: label.node_id,
                             in_arc: label.in_arc,
-                        });
+                        }, visited.clone()));
                     }
                 }
 
                 if !new_routes.is_empty() {
                     if verbose {
                         println!("Found {} candidate routes in the pool", new_routes.len());
-                        new_routes.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
+                        new_routes.sort_by(|a, b| a.0.reduced_cost.partial_cmp(&b.0.reduced_cost).unwrap());
                         new_routes.truncate(NUM_ROUTES_PER_NODE_ADDED * self.nodes.nodes.len());
                         // panic!("Candidate routes found in the pool, not implemented yet");
                     }
@@ -865,27 +1350,27 @@ impl ColGenModel {
 
                     for node_id in 0..self.nodes.nodes.len() {
                         let node_routes = &mut candidates[node_id];
-                        
-                        node_routes.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
+
+                        node_routes.sort_by(|a, b| a.0.reduced_cost.partial_cmp(&b.0.reduced_cost).unwrap());
 
                         for i in 0..NUM_ROUTES_PER_NODE_ADDED {
                             let label = if i < node_routes.len() {
-                                node_routes[i]
+                                &node_routes[i]
                             } else {
                                 break;
                             };
 
-                            if label.reduced_cost <= -EPS {
-                                new_routes.push(label);
+                            if label.0.reduced_cost <= -EPS {
+                                new_routes.push(label.clone());
                             } else {
-                                route_pool.push(label);
+                                route_pool.push(label.clone());
                             }
                         }
 
                         for i in NUM_ROUTES_PER_NODE_ADDED..NUM_ROUTES_PER_NODE_CALCULATED {
                             if i < node_routes.len() {
-                                let label = node_routes[i];
-                                route_pool.push(label);
+                                let label = &node_routes[i];
+                                route_pool.push(label.clone());
                             } else {
                                 break;
                             }
@@ -937,7 +1422,7 @@ impl ColGenModel {
                         
                         vlb = obj;
                         let v_gap = obj.ceil() - obj;
-                        vehicle_filter = Some(vehicle_lbs.iter().map(|lb| *lb > v_gap).collect::<Vec<_>>());
+                        vehicle_filter = Some(vehicle_lbs.iter().map(|lb| *lb > v_gap + EPS).collect::<Vec<_>>());
                         let num_filtered = vehicle_filter.as_ref().unwrap().iter().fold(0, |acc, &x| if x { acc + 1 } else { acc });
 
                         println!("Leveraged out {}/{} arcs", num_filtered, self.arcs.num_arcs());
@@ -1027,12 +1512,12 @@ impl ColGenModel {
             else {         
                 println!("Adding {} new routes", new_routes.len());
                 let raw_ref: *mut ColGenModel = self;
-                for route in new_routes.iter() {
+                for (route, visited) in new_routes.iter() {
                     let cost = route.cost as f64;
                     let covered = route.coverset.to_vec();
                     let reduced_cost = route.reduced_cost;
                     unsafe {
-                        raw_ref.as_mut().unwrap().add_route_var(cost, covered);
+                        raw_ref.as_mut().unwrap().add_route_var(cost, covered, visited.clone());
                     }
                     if verbose { println!("COST: {}, RC: {:.4}, COVER: {:?}", cost, reduced_cost, route.coverset.to_vec()); }
                 }
@@ -1245,7 +1730,7 @@ impl RouteIPModel {
         }
     }
 
-    pub fn solve(&mut self, verbose: bool) -> Result<f64, Error> {
+    pub fn solve(&mut self, verbose: bool) -> (Result<f64, Error>, Vec<f64>) {
         if verbose {
             println!("Solving Route IP Model with {} routes", self.routes.len());
         }
@@ -1254,11 +1739,12 @@ impl RouteIPModel {
 
         for (idx, route) in self.routes.iter().enumerate() {
             let value = self.model.get_obj_attr(X, route).unwrap();
-            if value < 0.0001 {
+            if value < EPS {
                 continue;
             }
             println!("Route variable: {:?}, cost: {:?}, covered: {:?}", route, self.costs[idx], (0..self.covered.len()).map(|r_id| self.covered[r_id][idx]).collect::<Vec<_>>());
         }
-        self.model.get_attr(attr::ObjVal)
+
+        (self.model.get_attr(attr::ObjVal), self.routes.iter().map(|route| self.model.get_obj_attr(X, route).unwrap()).collect())
     }
 }
