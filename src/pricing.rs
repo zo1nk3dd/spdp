@@ -654,7 +654,7 @@ impl<'a> BucketPricer<'a> {
         Some(new_label)
     }
 
-    fn forward_backward_pass(&mut self, k: usize, _obj: f64, verbose: bool) -> Vec<Vec<Label>> {
+    fn forward_backward_pass(&mut self, k: usize, obj: f64, verbose: bool) -> Vec<Vec<Label>> {
         // Create the initial labels
         self.initialise_forward_labels();
         self.forward_pass((self.data.t_limit as f64 * FORWARD_BACKWARD_PASS_MARK) as usize);
@@ -745,12 +745,12 @@ impl<'a> BucketPricer<'a> {
         if candidate_labels.iter().flatten().all(|label| label.reduced_cost > -EPS) && (self.phase == LPSolvePhase::VehicleCover || self.phase == LPSolvePhase::CostCover) {
             if verbose { println!("No candidate labels found in full coverage forward-backward pass"); }
             // Store the lower bounds at this point to grab again later
-            (self.lbs, self.route_arcs) = self.calculate_lower_rc_bounds_route_method(verbose, &forward_pass_info, &self.visited);
+            (self.lbs, self.route_arcs) = self.calculate_lower_rc_bounds_route_method(verbose, &forward_pass_info, &self.visited, obj);
         }
         candidate_labels
     }
 
-    fn calculate_lower_rc_bounds_route_method(&self, verbose: bool, forward_pass_info: &VisitedData, backward_pass_info: &VisitedData) -> (Vec<f64>, Vec<(Label, Vec<usize>)>) {
+    fn calculate_lower_rc_bounds_route_method(&self, verbose: bool, forward_pass_info: &VisitedData, backward_pass_info: &VisitedData, lb: f64) -> (Vec<f64>, Vec<(Label, Vec<usize>)>) {
 
         println!("\n\nCalculating lower RC bounds using route method\n\n");
 
@@ -800,6 +800,9 @@ impl<'a> BucketPricer<'a> {
             for forward_label in forward_labels_by_node[node].iter() {
                 for backward_label in backward_labels_by_node[node].iter() {
                     if let Some(finished_label) = self.finished_label(forward_label, Some(backward_label), None, forward_pass_info, 1e6) {
+                        if finished_label.reduced_cost >= lb * CONSERVATIVE_GAP_GUESS {
+                            break; // Skip if the reduced cost is not negative
+                        }
                         routes += 1;
                         let lb = finished_label.reduced_cost;
                         let mut curr = forward_label;

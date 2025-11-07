@@ -9,3 +9,5 @@ pub const NUM_ROUTES_PER_NODE_ADDED: usize = 3;
 pub const SRI_CONSTRAINTS_ENABLED: bool = true; // Whether to use the subset row inequalities
 pub const OVER_HALF_GAP_CUTS_ENABLED: bool = true; // Whether to use the over half gap cuts
 pub const NUM_ROUTES_FOR_RIP: usize = 10000;
+
+pub const CONSERVATIVE_GAP_GUESS: f64 = 1.2;
