@@ -313,13 +313,13 @@ impl Label {
                 self.reduced_cost - other.reduced_cost < EPS && self.duration <= other.duration
             },
             DominanceMode::DurRCCover => {
-                self.reduced_cost - other.reduced_cost < -EPS && self.duration < other.duration && self.visits_less_eq_than(other)
+                self.reduced_cost - other.reduced_cost < -EPS && self.duration <= other.duration && self.visits_less_eq_than(other)
             },
             DominanceMode::Dur => {
-                self.duration < other.duration
+                self.duration <= other.duration
             },
             DominanceMode::DurRCQuantity => {
-                self.reduced_cost - other.reduced_cost < -EPS && self.duration < other.duration && self.coverset.len < other.coverset.len
+                self.reduced_cost - other.reduced_cost < -EPS && self.duration <= other.duration && self.coverset.len <= other.coverset.len
             }
         }
     }

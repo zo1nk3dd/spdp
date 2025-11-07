@@ -863,6 +863,8 @@ impl ColGenModel {
 
         let subset_row_ineqs = vec![];
 
+        let route_arcs = Vec::new();
+
         let mut result = ColGenModel {
             data: data.clone(),
             arcs: arc_container,
@@ -871,11 +873,11 @@ impl ColGenModel {
             routes_covering_request: vec![Vec::new(); data.num_requests],
             lambda: Vec::new(),
             route_costs: Vec::new(),
-            route_arcs: Vec::new(),
             cover_constraints: Vec::new(),
             vehicle_constraint: None,
             max_vehicles: None,
             subset_row_ineqs,
+            route_arcs,
         };
 
         result.first_initialisation();
@@ -884,7 +886,7 @@ impl ColGenModel {
         result
     }
 
-    pub fn add_route_var(&mut self, cost: f64, covered: Vec<usize>, arcs: Vec<usize>) {
+    pub fn add_route_var(&mut self, cost: f64, covered: Vec<usize>) {
         // Add a new route to the model
         let route_id = self.lambda.len();
 
@@ -927,7 +929,6 @@ impl ColGenModel {
 
         self.lambda.push(lambda);
         self.route_costs.push(cost);
-        self.route_arcs.push(arcs);
     }
 
     pub fn initialise_model_constraints(&mut self) {
@@ -956,7 +957,7 @@ impl ColGenModel {
     }
 
     pub fn first_initialisation(&mut self) {
-        let mut initial_routes: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
+        let mut initial_routes: Vec<(usize, Vec<usize>)> = Vec::new();
         for arc in self.arcs.get_arcs() {
             if arc.start.is_pickup() && arc.end.is_depot() {
                 let mut covered = vec![0; self.data.num_requests];
@@ -966,17 +967,12 @@ impl ColGenModel {
                 if arc.done.len() == 2 {
                     covered[arc.done.right()] += 1;
                 }
-
-                let mut route_arcs = vec![arc.id];
-
-                route_arcs.push(self.arcs.arcs_from.get(&self.nodes.depot).unwrap().iter().find(|depot_arc: &&Arc| depot_arc.end.id == arc.start.id).map(|depot_arc| depot_arc.id).unwrap());
-
-                initial_routes.push((arc.cost + self.data.fixed_vehicle_cost, covered, route_arcs));
+                initial_routes.push((arc.cost + self.data.fixed_vehicle_cost, covered));
             }
         }
 
-        for (cost, covered, route_arcs) in initial_routes.iter() {
-            self.add_route_var(*cost as f64, covered.clone(), route_arcs.clone());
+        for (cost, covered) in initial_routes.iter() {
+            self.add_route_var(*cost as f64, covered.clone());
         }
     }
 
@@ -1024,7 +1020,7 @@ impl ColGenModel {
 
         let vehicle_filter = Some(vehicle_lbs.iter().map(|&lb| lb >= self.max_vehicles.unwrap() as f64 - vlb + EPS).collect::<Vec<bool>>());
         let mut cost_lbs = vec![];
-        let mut route_pool: Vec<(Label, Vec<usize>)> = vec![];
+        let mut route_pool: Vec<Label> = vec![];
         let mut mode = LPSolvePhase::CostNoCover;
         self.deactivate_sri_constraints(verbose);
 
@@ -1032,7 +1028,7 @@ impl ColGenModel {
             self.model.update().unwrap();
             self.model.optimize().unwrap();
 
-            let mut new_routes: Vec<(Label, Vec<usize>)> = Vec::new();
+            let mut new_routes: Vec<Label> = Vec::new();
             let obj = self.model.get_attr(attr::ObjVal).unwrap();
             println!("OBJVAL: {:?}", obj);
             let cover_duals = self.cover_constraints.iter()
@@ -1059,7 +1055,7 @@ impl ColGenModel {
 
             // Check the route pool for any candidate routes
 
-            for (label, visited) in route_pool.iter() {
+            for label in route_pool.iter() {
                 let reduced_cost = match mode {
                     LPSolvePhase::VehicleNoCover | LPSolvePhase::VehicleCover | LPSolvePhase::VehicleQuantity=> {
                         panic!("Should not be in vehicle phase");
@@ -1086,7 +1082,7 @@ impl ColGenModel {
                     if verbose {
                         println!("Route from pool with reduced cost: {:.4}", reduced_cost);
                     }
-                    new_routes.push((Label {
+                    new_routes.push(Label {
                         id: label.id,
                         reduced_cost,
                         duration: label.duration,
@@ -1095,14 +1091,14 @@ impl ColGenModel {
                         coverset: label.coverset,
                         node_id: label.node_id,
                         in_arc: label.in_arc,
-                    }, visited.clone()));
+                });
                 }
             }
 
             if !new_routes.is_empty() {
                 if verbose {
                     println!("Found {} candidate routes in the pool", new_routes.len());
-                    new_routes.sort_by(|a, b| a.0.reduced_cost.partial_cmp(&b.0.reduced_cost).unwrap());
+                    new_routes.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
                     new_routes.truncate(NUM_ROUTES_PER_NODE_ADDED * self.nodes.nodes.len());
                     // panic!("Candidate routes found in the pool, not implemented yet");
                 }
@@ -1122,12 +1118,12 @@ impl ColGenModel {
                     &vehicle_filter,
                 );
 
-                let mut candidates: Vec<Vec<(Label, Vec<usize>)>> = pricer.solve_pricing_problem(verbose, obj);
+                let mut candidates: Vec<Vec<Label>> = pricer.solve_pricing_problem(verbose, obj);
 
                 for node_id in 0..self.nodes.nodes.len() {
                     let node_routes = &mut candidates[node_id];
 
-                    node_routes.sort_by(|a, b| a.0.reduced_cost.partial_cmp(&b.0.reduced_cost).unwrap());
+                    node_routes.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
 
                     for i in 0..NUM_ROUTES_PER_NODE_ADDED {
                         let label = if i < node_routes.len() {
@@ -1136,7 +1132,7 @@ impl ColGenModel {
                             break;
                         };
 
-                        if label.0.reduced_cost <= -EPS {
+                        if label.reduced_cost <= -EPS {
                             new_routes.push(label.clone());
                         } else {
                             route_pool.push(label.clone());
@@ -1145,8 +1141,8 @@ impl ColGenModel {
 
                     for i in NUM_ROUTES_PER_NODE_ADDED..NUM_ROUTES_PER_NODE_CALCULATED {
                         if i < node_routes.len() {
-                            let (label, visited) = &node_routes[i];
-                            route_pool.push((label.clone(), visited.clone()));
+                            let label = &node_routes[i];
+                            route_pool.push(label.clone());
                         } else {
                             break;
                         }
@@ -1187,12 +1183,12 @@ impl ColGenModel {
             else {         
                 println!("Adding {} new routes", new_routes.len());
                 let raw_ref: *mut ColGenModel = self;
-                for (route, visited) in new_routes.iter() {
+                for route in new_routes.iter() {
                     let cost = route.cost as f64;
                     let covered = route.coverset.to_vec();
                     let reduced_cost = route.reduced_cost;
                     unsafe {
-                        raw_ref.as_mut().unwrap().add_route_var(cost, covered, visited.clone());
+                        raw_ref.as_mut().unwrap().add_route_var(cost, covered);
                     }
                     if verbose { println!("COST: {}, RC: {:.4}, COVER: {:?}", cost, reduced_cost, route.coverset.to_vec()); }
                 }
@@ -1205,7 +1201,7 @@ impl ColGenModel {
     /// * `verbose` - If true, prints detailed information about the solving process
     /// # Returns
     /// The optimal objective value found by the model
-    pub fn solve(&mut self, verbose: bool) -> (f64, f64, f64, Vec<f64>, Vec<f64>) {
+    pub fn solve(&mut self, verbose: bool) -> (f64, f64, f64, Vec<f64>, Vec<f64>, Vec<(Label, Vec<usize>)>) {
         self.model.set_param(OutputFlag, 0).unwrap();
         self.model.set_attr(ModelSense, Minimize).unwrap();
 
@@ -1215,12 +1211,13 @@ impl ColGenModel {
 
         let mut mode = LPSolvePhase::VehicleNoCover;
 
-        let mut route_pool: Vec<(Label, Vec<usize>)> = Vec::new();
+        let mut route_pool: Vec<Label> = Vec::new();
 
         let mut vlb = 0.0;
     
         let mut vehicle_lbs = Vec::new();
         let mut cost_lbs = Vec::new();
+        let mut route_arcs = Vec::new();
 
         let mut vehicle_filter: Option<Vec<bool>> = None;
 
@@ -1240,7 +1237,7 @@ impl ColGenModel {
                 }
             }
 
-            let mut new_routes: Vec<(Label, Vec<usize>)> = Vec::new();
+            let mut new_routes: Vec<Label> = Vec::new();
             let obj = self.model.get_attr(attr::ObjVal).unwrap();
             println!("OBJVAL: {:?}", obj);
             if self.vehicle_constraint.is_none() && obj - EPS < 1.0 {
@@ -1291,7 +1288,7 @@ impl ColGenModel {
 
                 // Check the route pool for any candidate routes
 
-                for (label, visited) in route_pool.iter() {
+                for label in route_pool.iter() {
                     let reduced_cost = match mode {
                         LPSolvePhase::VehicleNoCover | LPSolvePhase::VehicleCover | LPSolvePhase::VehicleQuantity=> {
                             1.0 - label.coverset.to_vec().iter().enumerate()
@@ -1329,7 +1326,7 @@ impl ColGenModel {
                         if verbose {
                             println!("Route from pool with reduced cost: {:.4}", reduced_cost);
                         }
-                        new_routes.push((Label {
+                        new_routes.push(Label {
                             id: label.id,
                             reduced_cost,
                             duration: label.duration,
@@ -1338,14 +1335,14 @@ impl ColGenModel {
                             coverset: label.coverset,
                             node_id: label.node_id,
                             in_arc: label.in_arc,
-                        }, visited.clone()));
+                        });
                     }
                 }
 
                 if !new_routes.is_empty() {
                     if verbose {
                         println!("Found {} candidate routes in the pool", new_routes.len());
-                        new_routes.sort_by(|a, b| a.0.reduced_cost.partial_cmp(&b.0.reduced_cost).unwrap());
+                        new_routes.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
                         new_routes.truncate(NUM_ROUTES_PER_NODE_ADDED * self.nodes.nodes.len());
                         // panic!("Candidate routes found in the pool, not implemented yet");
                     }
@@ -1370,7 +1367,7 @@ impl ColGenModel {
                     for node_id in 0..self.nodes.nodes.len() {
                         let node_routes = &mut candidates[node_id];
 
-                        node_routes.sort_by(|a, b| a.0.reduced_cost.partial_cmp(&b.0.reduced_cost).unwrap());
+                        node_routes.sort_by(|a, b| a.reduced_cost.partial_cmp(&b.reduced_cost).unwrap());
 
                         for i in 0..NUM_ROUTES_PER_NODE_ADDED {
                             let label = if i < node_routes.len() {
@@ -1379,7 +1376,7 @@ impl ColGenModel {
                                 break;
                             };
 
-                            if label.0.reduced_cost <= -EPS {
+                            if label.reduced_cost <= -EPS {
                                 new_routes.push(label.clone());
                             } else {
                                 route_pool.push(label.clone());
@@ -1398,10 +1395,12 @@ impl ColGenModel {
                     if new_routes.is_empty() {
                         if mode == LPSolvePhase::VehicleCover {
                             vehicle_lbs = pricer.get_lbs();
+
                         }
 
                         if mode == LPSolvePhase::CostCover {
                             cost_lbs = pricer.get_lbs();
+                            route_arcs = pricer.route_arcs;
                         }
                     }
                 }
@@ -1461,7 +1460,7 @@ impl ColGenModel {
                         // Successfully solved the second phase of the problem
                         println!("Optimal obj {} found after {} iterations", self.model.get_attr(ObjVal).unwrap(), iter);
 
-                        return (self.model.get_attr(attr::ObjVal).unwrap(), vlb, best_vehicle_count as f64, vehicle_lbs, cost_lbs);
+                        return (self.model.get_attr(attr::ObjVal).unwrap(), vlb, best_vehicle_count as f64, vehicle_lbs, cost_lbs, route_arcs);
                     },
                 }
 
@@ -1531,12 +1530,12 @@ impl ColGenModel {
             else {         
                 println!("Adding {} new routes", new_routes.len());
                 let raw_ref: *mut ColGenModel = self;
-                for (route, visited) in new_routes.iter() {
+                for route in new_routes.iter() {
                     let cost = route.cost as f64;
                     let covered = route.coverset.to_vec();
                     let reduced_cost = route.reduced_cost;
                     unsafe {
-                        raw_ref.as_mut().unwrap().add_route_var(cost, covered, visited.clone());
+                        raw_ref.as_mut().unwrap().add_route_var(cost, covered);
                     }
                     if verbose { println!("COST: {}, RC: {:.4}, COVER: {:?}", cost, reduced_cost, route.coverset.to_vec()); }
                 }

@@ -117,6 +117,15 @@ impl CoverSet {
         0 == !((other.covered | self.manager.overflow_flag_mask) - self.covered) & self.manager.overflow_flag_mask
     }
 
+    pub fn get_cover(&self, request_id: usize) -> usize {
+        let offset = self.manager.offsets[request_id];
+        let mut result = self.covered >> offset;
+        if request_id != self.manager.offsets.len() - 1 {
+            result &= (1 << (self.manager.offsets[request_id + 1] - offset)) - 1;   
+        }
+        result as usize
+    }
+
     pub fn to_vec(&self) -> Vec<usize> {
         assert!(self.is_valid(), "CoverSet is not valid, cannot iterate");
         self.manager.offsets.iter().enumerate().filter_map(|(i, &offset)| {
@@ -182,7 +191,7 @@ mod tests {
         assert!(cover_set.cover(0).is_err());
         assert!(cover_set.is_valid());
         assert!(cover_set.cover(2).is_ok());
-        assert!(cover_set.cover(2).is_ok());
+        assert!(!cover_set.cover(2).is_ok());
         assert!(cover_set.cover(2).is_err());
         assert!(cover_set.is_valid());
     }
@@ -236,5 +245,15 @@ mod tests {
         
         let vec = cover_set.to_vec();
         assert_eq!(vec, vec![1, 1, 1, 0, 0, 1, 0, 0]); // Assuming the first three requests are covered
+
+        assert!(cover_set.get_cover(0) == 1);
+        assert!(cover_set.get_cover(1) == 1);
+        assert!(cover_set.get_cover(2) == 1);
+        assert!(cover_set.get_cover(3) == 0);
+        assert!(cover_set.get_cover(5) == 1);
+
+        cover_set.cover(7).unwrap();
+        cover_set.cover(7).unwrap();
+        assert!(cover_set.get_cover(7) == 2);
     }
 }

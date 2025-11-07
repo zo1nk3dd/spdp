@@ -1,4 +1,5 @@
 use spdp::constants::EPS;
+use spdp::constants::NUM_ROUTES_FOR_RIP;
 use spdp::model::*;
 use spdp::utils::*;
 use std::env;
@@ -24,13 +25,28 @@ fn main() {
 
     let mut model = ColGenModel::new(data.clone());
 
-    let (mut zlb, vlb, mut v_guess, vehicle_lbs, mut cost_lbs) = model.solve(verbose);
-    let mut zub = f64::INFINITY;
+    let (mut zlb, vlb, mut v_guess, vehicle_lbs, mut cost_lbs, mut route_arcs) = model.solve(verbose);
 
     let mut best_sol: Vec<Vec<usize>> = Vec::new();
 
+    route_arcs.sort_by(|a, b| {
+        a.0.reduced_cost.total_cmp(&b.0.reduced_cost)
+    });
+
+    let mut route_costs = Vec::new();
+    let mut routes_covering_request: Vec<Vec<usize>> = vec![Vec::new(); data.requests.len()];
+
+    for arc in route_arcs.iter().take(NUM_ROUTES_FOR_RIP as usize) {
+        route_costs.push(arc.0.cost as f64);
+        for (idx, cnt) in arc.0.coverset.to_vec().iter().enumerate() {
+            routes_covering_request[idx].push(*cnt);
+        }
+    }
+
+    let zub: f64;
+
     loop {
-        let mut route_ip: RouteIPModel = RouteIPModel::new(&data, &model.route_costs, &model.routes_covering_request, v_guess as usize);
+        let mut route_ip: RouteIPModel = RouteIPModel::new(&data, &route_costs, &routes_covering_request, v_guess as usize);
 
         let (result, route_sol) = route_ip.solve(verbose);
 
@@ -39,7 +55,7 @@ fn main() {
             println!("Upper bound found: {}", zub);
             for (idx, obj) in route_sol.iter().enumerate() {
                 if *obj > EPS {
-                    best_sol.push(model.route_arcs[idx].clone());
+                    best_sol.push(route_arcs[idx].1.clone());
                 }
             }
             break;
