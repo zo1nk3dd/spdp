@@ -79,7 +79,7 @@ impl<'a> CallbackContext<'a> {
                 }
             }
             if OVER_HALF_GAP_CUTS_ENABLED {
-                // Add big-M cuts for these arcs
+                // Add cuts for these arcs
                 for k in 0..self.x.len() {
                     for arc in arcs_above_half.iter() {
                         ctx.add_lazy(c!(self.x[k][*arc] <= self.y[k])).unwrap();
@@ -812,7 +812,7 @@ impl MasterProblemModel {
         self.model.set_attr(ModelSense, Minimize).unwrap();
         self.model.set_param(LazyConstraints, 1).unwrap();
         self.model.set_param(BranchDir, 1).unwrap();
-        self.model.set_param(MIPFocus, 1).unwrap();
+        self.model.set_param(MIPFocus, 2).unwrap();
         self.model.set_param(Threads, 16).unwrap();
 
         self.set_initial_solution(&best_sol, verbose);
