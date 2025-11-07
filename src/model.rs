@@ -509,13 +509,7 @@ impl MasterProblemModel {
         println!("Filtered {}/{} arcs from the master problem", filtered, filter.len());
     }
 
-    pub fn solve(&mut self, verbose: bool, cg_lb: f64, best_rc_per_arc: Vec<f64>, best_sol: Vec<Vec<usize>>) -> Result<f64, Error> {
-        self.model.set_attr(ModelSense, Minimize).unwrap();
-        self.model.set_param(LazyConstraints, 1).unwrap();
-        self.model.set_param(BranchDir, 1).unwrap();
-        self.model.set_param(MIPFocus, 1).unwrap();
-        self.model.set_param(Threads, 16).unwrap();
-
+    fn set_initial_solution(&mut self, best_sol: &Vec<Vec<usize>>, verbose: bool) {
         let mut route_cover: Vec<Vec<usize>> = vec![vec![0; self.data.num_requests]; self.x.len()];
 
         // Turn the vectors of arc_ids in best_sol to (arc_id, count) pairs
@@ -654,18 +648,34 @@ impl MasterProblemModel {
                         if verbose {
                             println!("Added back request {} using arc {}", new_arc.unwrap().done.left(), new_arc.unwrap().id);
                         }
+                        add_back[new_arc.unwrap().done.left()] -= 1;
                     }
                 } else {
                     let new_arc = self.arcs.arcs_from.get(&self.nodes.nodes.get(end_loc.unwrap()).unwrap()).unwrap().iter().find(|arc| {
-                        arc.end.id == start_loc.unwrap() && arc.done.len() > 1 && add_back[arc.done.left()] > 0 && add_back[arc.done.right()] > 0
+                        arc.end.id == start_loc.unwrap() && arc.done.len() > 1 && add_back[arc.done.left()] > 0 && add_back[arc.done.right()] > 0 && 
+                        (arc.done.left() != arc.done.right() && add_back[arc.done.left()] == 1) // prevent using the same request twice if only one is needed
                     });
                     if new_arc.is_none() {
-                        println!("Could not find replacement arc from {} to {} to add back request", start_loc.unwrap(), end_loc.unwrap());
+                        println!("Could not find replacement arc from {} to {} to add back request: trying a one length arc", start_loc.unwrap(), end_loc.unwrap());
+                        let new_arc = self.arcs.arcs_from.get(&self.nodes.nodes.get(end_loc.unwrap()).unwrap()).unwrap().iter().find(|arc| {
+                            arc.end.id == start_loc.unwrap() && arc.done.len() == 1 && add_back[arc.done.left()] > 0
+                        });
+                        if new_arc.is_none() {
+                            println!("Could not find replacement arc from {} to {} to add back request", start_loc.unwrap(), end_loc.unwrap());
+                        } else {
+                            route.push((new_arc.unwrap().id, 1));
+                            if verbose {
+                                println!("Added back request {} using arc {}", new_arc.unwrap().done.left(), new_arc.unwrap().id);
+                            }
+                            add_back[new_arc.unwrap().done.left()] -= 1;
+                        }
                     } else {
                         route.push((new_arc.unwrap().id, 1));
                         if verbose {
                             println!("Added back requests {} and {} using arc {}", new_arc.unwrap().done.left(), new_arc.unwrap().done.right(), new_arc.unwrap().id);
                         }
+                        add_back[new_arc.unwrap().done.left()] -= 1;
+                        add_back[new_arc.unwrap().done.right()] -= 1;
                     }
                 }
             }
@@ -791,12 +801,21 @@ impl MasterProblemModel {
             for (arc_id, count) in route.iter() {
                 if verbose {
                     println!("Assigning arc {} (count {}) to vehicle {}", arc_id, count, vehicle_to_be_assigned);
-
                 }
                 self.model.set_obj_attr(Start, &self.x[vehicle_to_be_assigned][*arc_id], *count as f64).unwrap();
             }
             vehicle_to_be_assigned += 1;
         }
+    }
+
+    pub fn solve(&mut self, verbose: bool, cg_lb: f64, best_rc_per_arc: Vec<f64>, best_sol: Vec<Vec<usize>>) -> Result<f64, Error> {
+        self.model.set_attr(ModelSense, Minimize).unwrap();
+        self.model.set_param(LazyConstraints, 1).unwrap();
+        self.model.set_param(BranchDir, 1).unwrap();
+        self.model.set_param(MIPFocus, 1).unwrap();
+        self.model.set_param(Threads, 16).unwrap();
+
+        self.set_initial_solution(&best_sol, verbose);
 
         let mut callback_context = CallbackContext::new(&self.data, &self.nodes, &self.arcs, &self.x, &self.y, verbose, cg_lb, best_rc_per_arc, self.already_filtered.clone());
         self.model.optimize_with_callback(&mut callback_context).unwrap();
