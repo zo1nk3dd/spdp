@@ -27,6 +27,8 @@ fn main() {
 
     let (mut zlb, vlb, mut v_guess, vehicle_lbs, mut cost_lbs, mut route_arcs) = model.solve(verbose);
 
+    println!("\n\nCG SOLVE TIME: {:?}\n\n", start.elapsed());
+
     let mut best_sol: Vec<Vec<usize>> = Vec::new();
 
     route_arcs.sort_by(|a, b| {
@@ -75,17 +77,15 @@ fn main() {
         }
     }
 
-    println!("Upper bound guess: {}", zub);
+    println!("UB: {}", zub);
 
-    println!("Lower bound: {}", zlb);
+    println!("LB: {}", zlb);
     let v_count = model.max_vehicles.unwrap();
-    println!("Number of vehicles: {}", v_count);
-
-    println!("Time elapsed: {:?}", start.elapsed());
+    println!("VEH_COUNT: {}", v_count);
 
     let v_gap = v_guess - vlb;
 
-    println!(" Vehicle gap: {}", v_gap);
+    println!("VEH_GAP: {}", v_gap);
 
     let mut filter = vec![false; cost_lbs.len()];
     
@@ -97,7 +97,7 @@ fn main() {
 
     let z_gap = zub - zlb;
 
-    println!(" Cost gap: {}", z_gap);
+    println!("COST_GAP: {}", z_gap);
 
     for (idx, cost_lb) in cost_lbs.iter().enumerate() {
         if *cost_lb > z_gap + EPS {

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::vec;
 use grb::attribute::VarDoubleAttr::Start;
+use grb::parameter::DoubleParam::TimeLimit;
 use grb::parameter::IntParam::BranchDir;
 use grb::parameter::IntParam::MIPFocus;
 use grb::parameter::IntParam::Threads;
@@ -814,6 +815,7 @@ impl MasterProblemModel {
         self.model.set_param(BranchDir, 1).unwrap();
         self.model.set_param(MIPFocus, MIP_FOCUS).unwrap();
         self.model.set_param(Threads, 16).unwrap();
+        self.model.set_param(TimeLimit, 3600.0).unwrap();
 
         self.set_initial_solution(&best_sol, verbose);
 
