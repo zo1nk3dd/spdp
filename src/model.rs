@@ -812,7 +812,7 @@ impl MasterProblemModel {
         self.model.set_attr(ModelSense, Minimize).unwrap();
         self.model.set_param(LazyConstraints, 1).unwrap();
         self.model.set_param(BranchDir, 1).unwrap();
-        self.model.set_param(MIPFocus, 2).unwrap();
+        self.model.set_param(MIPFocus, MIP_FOCUS).unwrap();
         self.model.set_param(Threads, 16).unwrap();
 
         self.set_initial_solution(&best_sol, verbose);

@@ -11,3 +11,4 @@ pub const OVER_HALF_GAP_CUTS_ENABLED: bool = true; // Whether to use the over ha
 pub const NUM_ROUTES_FOR_RIP: usize = 10000;
 
 pub const CONSERVATIVE_GAP_GUESS: f64 = 1.2;
+pub const MIP_FOCUS: i32 = 0;
