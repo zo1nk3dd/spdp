@@ -320,6 +320,9 @@ impl Label {
             },
             DominanceMode::DurRCQuantity => {
                 self.reduced_cost - other.reduced_cost < -EPS && self.duration <= other.duration && self.coverset.len <= other.coverset.len
+            },
+            DominanceMode::Route => {
+                self.cost < other.cost
             }
         }
     }

@@ -1203,7 +1203,7 @@ impl ColGenModel {
     /// * `verbose` - If true, prints detailed information about the solving process
     /// # Returns
     /// The optimal objective value found by the model
-    pub fn solve(&mut self, verbose: bool) -> (f64, f64, f64, Vec<f64>, Vec<f64>, Vec<(Label, Vec<usize>)>) {
+    pub fn solve(&mut self, verbose: bool) -> (f64, f64, f64, Vec<f64>, Vec<f64>, FinalRoutesData, Vec<(usize, Vec<usize>)>) {
         self.model.set_param(OutputFlag, 0).unwrap();
         self.model.set_attr(ModelSense, Minimize).unwrap();
 
@@ -1219,9 +1219,11 @@ impl ColGenModel {
     
         let mut vehicle_lbs = Vec::new();
         let mut cost_lbs = Vec::new();
-        let mut route_arcs = Vec::new();
+        let mut route_arcs: Vec<(usize, Vec<usize>)> = Vec::new();
 
         let mut vehicle_filter: Option<Vec<bool>> = None;
+
+        let mut final_labels: FinalRoutesData = FinalRoutesData::new(0);
 
         loop {
             self.model.update().unwrap();
@@ -1403,6 +1405,7 @@ impl ColGenModel {
                         if mode == LPSolvePhase::CostCover {
                             cost_lbs = pricer.get_lbs();
                             route_arcs = pricer.route_arcs;
+                            final_labels = pricer.final_labels;
                         }
                     }
                 }
@@ -1462,7 +1465,7 @@ impl ColGenModel {
                         // Successfully solved the second phase of the problem
                         println!("Optimal obj {} found after {} iterations", self.model.get_attr(ObjVal).unwrap(), iter);
 
-                        return (self.model.get_attr(attr::ObjVal).unwrap(), vlb, best_vehicle_count as f64, vehicle_lbs, cost_lbs, route_arcs);
+                        return (self.model.get_attr(attr::ObjVal).unwrap(), vlb, best_vehicle_count as f64, vehicle_lbs, cost_lbs, final_labels, route_arcs);
                     },
                 }
 
@@ -1757,12 +1760,14 @@ impl RouteIPModel {
         self.model.set_attr(ModelSense, Minimize).unwrap();
         self.model.optimize().unwrap();
 
-        for (idx, route) in self.routes.iter().enumerate() {
-            let value = self.model.get_obj_attr(X, route).unwrap();
-            if value < EPS {
-                continue;
+        if self.model.status().unwrap() == grb::Status::Optimal {
+            for (idx, route) in self.routes.iter().enumerate() {
+                let value = self.model.get_obj_attr(X, route).unwrap();
+                if value < EPS {
+                    continue;
+                }
+                println!("Route variable: {:?}, cost: {:?}, covered: {:?}", route, self.costs[idx], (0..self.covered.len()).map(|r_id| self.covered[r_id][idx]).collect::<Vec<_>>());
             }
-            println!("Route variable: {:?}, cost: {:?}, covered: {:?}", route, self.costs[idx], (0..self.covered.len()).map(|r_id| self.covered[r_id][idx]).collect::<Vec<_>>());
         }
 
         (self.model.get_attr(attr::ObjVal), self.routes.iter().map(|route| self.model.get_obj_attr(X, route).unwrap()).collect())

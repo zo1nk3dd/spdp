@@ -19,6 +19,7 @@ pub enum DominanceMode {
     DurRCCover,
     Dur,
     DurRCQuantity,
+    Route,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -298,6 +299,112 @@ impl VisitedData {
     }
 }
 
+pub struct FinalRoutesData {
+    pub visited: Vec<HashMap<SIZE, Vec<usize>>>,
+    pub depot_labels: Vec<usize>,
+    pub labels: Vec<Label>,
+    pub cut_in: usize,
+    pub cut_out: usize,
+    pub better: usize,
+}
+
+impl FinalRoutesData {
+    pub fn new(num_nodes: usize) -> Self {
+        FinalRoutesData {
+            visited: vec![HashMap::new(); num_nodes],
+            depot_labels: Vec::new(),
+            labels: Vec::new(),
+            cut_in: 0,
+            cut_out: 0,
+            better: 0,
+        }
+    }
+
+    /// Checks if a label is already visited in the current phase
+    /// It needs to use the correct key based on the phase
+    /// This depends upon the logic in the `add_if_improvement` function
+    fn contains_label(&self, label: &Label, phase: LPSolvePhase) -> bool {
+        let bucket = &self.visited[label.node_id];
+        let key = match phase {
+            LPSolvePhase::VehicleNoCover | LPSolvePhase::CostNoCover => 0,
+            LPSolvePhase::VehicleQuantity | LPSolvePhase::CostQuantity => label.coverset.len as SIZE,
+            LPSolvePhase::VehicleCover | LPSolvePhase::CostCover => label.coverset.covered,
+        };
+        if let Some(label_ids) = bucket.get(&key) {
+            return label_ids.iter().any(|id| *id == label.id);
+        }
+        false
+    }
+
+    /// Attempts to add a label to the visited data structure, and returns the result
+    fn add_if_improvement(&mut self, label: Label) -> bool {  
+        // println!("Adding label id {} at node {}", label.id, label.node_id);
+        // println!("Cost: {}, Duration: {}", label.cost, label.duration);
+        let bucket = &mut self.visited[label.node_id];
+        assert!(self.labels.len() == label.id);
+        // assert!(bucket.iter().all(|l| !l.is_empty()), "Bucket should not contain empty labels");
+        // If we reach here, the label is an improvement
+        let result = bucket.get(&label.coverset.covered);
+
+        if let Some(label_ids) = result {
+            for id in label_ids.iter() {
+                if self.labels[*id].dominates(&label, DominanceMode::Route) {
+                    self.cut_in += 1;
+                    return false; // If the new label is dominated by any of the previous labels, it's not an improvement
+                }
+            }
+        }
+
+        let result = bucket.get_mut(&label.coverset.covered);
+
+        if let Some(label_ids) = result {
+            let len_before = label_ids.len();
+            label_ids.retain(|id| {
+                // Remove dominated labels
+                !label.dominates(&self.labels[*id], DominanceMode::Route)
+            });
+            let len_after = label_ids.len();
+            self.cut_out += len_before - len_after;
+            self.better += 1;
+            label_ids.push(label.id);
+        } else {
+            // This cover set has not been found before;
+            bucket.insert(label.coverset.covered, vec![label.id]);
+        }
+        self.labels.push(label); // Add the label to the labels vector
+        true
+    }
+
+    fn get_label_ids_by_node(&self, node_id: usize) -> Vec<usize> {
+        self.visited[node_id].values().flatten().map(|id| *id).collect()
+    }
+
+    // fn get_label_ids_by_node_covered(&self, node_id: usize, covered: &CoverSet) -> Vec<usize> {
+    //     let result = self.visited[node_id].get(&covered.covered);
+    //     if result.is_some() {
+    //         result.unwrap().clone()
+    //     } else {    
+    //         vec![]
+    //     }
+    // }
+
+    // fn get_finished_labels(&self) -> Vec<Label> {
+    //     self.depot_labels.iter().map(|id| self.labels[*id]).collect()
+    // }
+    
+    fn print_visited_info(&self) {
+        println!("Visited info:");
+        println!("  Cut in: {}", self.cut_in);
+        println!("  Cut out: {}", self.cut_out);
+        println!("  Better labels: {}", self.better);
+        println!("  Total labels: {}", self.labels.len());
+    }
+
+    fn num_labels(&self) -> usize {
+        self.labels.len()
+    }
+}
+
 pub trait Pricer {
     fn solve_pricing_problem(&mut self, verbose: bool, objective: f64) -> Vec<Vec<Label>>;
 }
@@ -387,7 +494,8 @@ pub struct BucketPricer<'a> {
     nodes: &'a NodeContainer,
     visited: VisitedData,
     pub lbs: Vec<f64>,
-    pub route_arcs: Vec<(Label, Vec<usize>)>,
+    pub route_arcs: Vec<(usize, Vec<usize>)>,
+    pub final_labels: FinalRoutesData,
     filter: &'a Option<Vec<bool>>,
 }
 
@@ -408,6 +516,7 @@ impl<'a> BucketPricer<'a> {
             nodes,
             visited,
             lbs,
+            final_labels: FinalRoutesData::new(nodes.nodes.len()),
             filter,
             route_arcs,
         }
@@ -646,6 +755,8 @@ impl<'a> BucketPricer<'a> {
 
         new_label.cost += backward_label.cost;
         new_label.duration += backward_label.duration;
+
+        new_label.node_id = self.nodes.depot.id;
         
         if new_label.duration > self.data.t_limit {
             return None; // Skip if the new duration exceeds the time limit
@@ -745,19 +856,21 @@ impl<'a> BucketPricer<'a> {
         if candidate_labels.iter().flatten().all(|label| label.reduced_cost > -EPS) && (self.phase == LPSolvePhase::VehicleCover || self.phase == LPSolvePhase::CostCover) {
             if verbose { println!("No candidate labels found in full coverage forward-backward pass"); }
             // Store the lower bounds at this point to grab again later
-            (self.lbs, self.route_arcs) = self.calculate_lower_rc_bounds_route_method(verbose, &forward_pass_info, &self.visited, obj);
+            (self.lbs, self.final_labels, self.route_arcs) = self.calculate_lower_rc_bounds_route_method(verbose, &forward_pass_info, &self.visited, obj);
         }
         candidate_labels
     }
 
-    fn calculate_lower_rc_bounds_route_method(&self, verbose: bool, forward_pass_info: &VisitedData, backward_pass_info: &VisitedData, lb: f64) -> (Vec<f64>, Vec<(Label, Vec<usize>)>) {
+    fn calculate_lower_rc_bounds_route_method(&self, verbose: bool, forward_pass_info: &VisitedData, backward_pass_info: &VisitedData, lb: f64) -> (Vec<f64>, FinalRoutesData, Vec<(usize, Vec<usize>)>) {
 
         println!("\n\nCalculating lower RC bounds using route method\n\n");
+
+        let mut finished_labels = FinalRoutesData::new(self.nodes.nodes.len());
 
         let maximum_reduced_cost: f64 = 1e6;
         let mut lbs = vec![maximum_reduced_cost; self.arcs.num_arcs()];
         let mut routes = 0;
-        let mut route_arcs = Vec::new();
+        let mut route_arcs: Vec<(usize, Vec<usize>)> = Vec::new(); // This grows reeally really big, don't need to keep all the routes
         let forward_labels_by_node: Vec<Vec<Label>> = self.nodes.nodes.iter()
             .map(|node| {
                 let mut labels = forward_pass_info.get_label_ids_by_node(node.id).iter().map(|id| forward_pass_info.labels[*id].clone()).collect::<Vec<_>>();
@@ -774,11 +887,9 @@ impl<'a> BucketPricer<'a> {
         
         // Depot nodes
         for label in forward_labels_by_node[self.nodes.depot.id].iter() {
-            if let Some(finished_label) = self.finished_label(label, None, None, forward_pass_info, 1e6) {
+            if let Some(mut finished_label) = self.finished_label(label, None, None, forward_pass_info, 1e6) {
+                finished_label.id = finished_labels.num_labels();
                 let mut visited_arcs = Vec::new();
-
-                routes += 1;
-
                 let lb = finished_label.reduced_cost;
                 let mut curr = label;
                 loop {
@@ -789,7 +900,10 @@ impl<'a> BucketPricer<'a> {
                     }
                     curr = &forward_pass_info.labels[curr.predecessor.unwrap()];
                 }
-                route_arcs.push((finished_label, visited_arcs));
+                if finished_labels.add_if_improvement(finished_label) {
+                    routes += 1;
+                    route_arcs.push((finished_label.id, visited_arcs));
+                }
             }
         }
 
@@ -799,11 +913,12 @@ impl<'a> BucketPricer<'a> {
             }
             for forward_label in forward_labels_by_node[node].iter() {
                 for backward_label in backward_labels_by_node[node].iter() {
-                    if let Some(finished_label) = self.finished_label(forward_label, Some(backward_label), None, forward_pass_info, 1e6) {
+                    if let Some(mut finished_label) = self.finished_label(forward_label, Some(backward_label), None, forward_pass_info, 1e6) {
                         if finished_label.reduced_cost >= lb * CONSERVATIVE_GAP_GUESS {
                             break; // Skip if the reduced cost is not negative
                         }
-                        routes += 1;
+                        finished_label.id = finished_labels.num_labels();
+                        
                         let lb = finished_label.reduced_cost;
                         let mut curr = forward_label;
                         let mut visited_arcs = Vec::new();
@@ -824,15 +939,16 @@ impl<'a> BucketPricer<'a> {
                             }
                             curr = &backward_pass_info.labels[curr.predecessor.unwrap()];
                         }
-                        route_arcs.push((finished_label, visited_arcs));
-                    } else {
+                        if finished_labels.add_if_improvement(finished_label) {
+                            route_arcs.push((finished_label.id, visited_arcs));
+                        }
                         continue;
                     }
                 }
             }
         }
         println!("Routes found: {}", routes);
-        (lbs, route_arcs)
+        (lbs, finished_labels, route_arcs)
     }
 
     // pub fn calculate_lower_rc_bounds(&mut self, verbose: bool) -> Vec<f64> {

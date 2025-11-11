@@ -25,22 +25,22 @@ fn main() {
 
     let mut model = ColGenModel::new(data.clone());
 
-    let (mut zlb, vlb, mut v_guess, vehicle_lbs, mut cost_lbs, mut route_arcs) = model.solve(verbose);
+    let (mut zlb, vlb, mut v_guess, vehicle_lbs, mut cost_lbs, mut final_labels, mut route_arcs) = model.solve(verbose);
 
-    println!("\n\nCG SOLVE TIME: {:?}\n\n", start.elapsed());
+    let cg_solve_time = start.elapsed();
 
     let mut best_sol: Vec<Vec<usize>> = Vec::new();
 
     route_arcs.sort_by(|a, b| {
-        a.0.reduced_cost.total_cmp(&b.0.reduced_cost)
+        final_labels.labels[a.0].reduced_cost.total_cmp(&final_labels.labels[b.0].reduced_cost)
     });
 
     let mut route_costs = Vec::new();
     let mut routes_covering_request: Vec<Vec<usize>> = vec![Vec::new(); data.requests.len()];
 
     for arc in route_arcs.iter().take(NUM_ROUTES_FOR_RIP as usize) {
-        route_costs.push(arc.0.cost as f64);
-        for (idx, cnt) in arc.0.coverset.to_vec().iter().enumerate() {
+        route_costs.push(final_labels.labels[arc.0].cost as f64);
+        for (idx, cnt) in final_labels.labels[arc.0].coverset.to_vec().iter().enumerate() {
             routes_covering_request[idx].push(*cnt);
         }
     }
@@ -109,10 +109,7 @@ fn main() {
         filter[*arc_id] = false;
     }
 
-    println!(
-        "Filtered {:} / {} arcs before solving MP",
-        filter.iter().filter(|&&b| b).count(), filter.len()
-    );
+    let pre_solve_filtered = filter.iter().filter(|&&b| b).count();
 
     let mut master = MasterProblemModel::new(data.clone(), model.arcs, model.nodes, v_count, filter.clone());
 
@@ -133,7 +130,15 @@ fn main() {
             }
         }
     }
+    println!("\n\nFINAL RESULTS:");
     println!("CG vehicle soln: {}", vlb);
     println!("CG cost soln: {}", zlb);
-    println!("Time elapsed: {:?}", start.elapsed());
+    println!("CG solve time: {:?}", cg_solve_time);
+    println!("\n");
+    println!("Filtered {} / {} arcs before solving MP", pre_solve_filtered, filter.len());
+    println!("\n");
+    println!("UB: {}", master.model.get_attr(grb::attr::ObjVal).unwrap());
+    println!("LB: {}", master.model.get_attr(grb::attr::ObjBound).unwrap());
+    println!("Gap: {}", master.model.get_attr(grb::attr::MIPGap).unwrap());
+    println!("Solve time: {:?}", master.model.get_attr(grb::attr::Runtime).unwrap());
 }
