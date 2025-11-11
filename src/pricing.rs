@@ -320,22 +320,6 @@ impl FinalRoutesData {
         }
     }
 
-    /// Checks if a label is already visited in the current phase
-    /// It needs to use the correct key based on the phase
-    /// This depends upon the logic in the `add_if_improvement` function
-    fn contains_label(&self, label: &Label, phase: LPSolvePhase) -> bool {
-        let bucket = &self.visited[label.node_id];
-        let key = match phase {
-            LPSolvePhase::VehicleNoCover | LPSolvePhase::CostNoCover => 0,
-            LPSolvePhase::VehicleQuantity | LPSolvePhase::CostQuantity => label.coverset.len as SIZE,
-            LPSolvePhase::VehicleCover | LPSolvePhase::CostCover => label.coverset.covered,
-        };
-        if let Some(label_ids) = bucket.get(&key) {
-            return label_ids.iter().any(|id| *id == label.id);
-        }
-        false
-    }
-
     /// Attempts to add a label to the visited data structure, and returns the result
     fn add_if_improvement(&mut self, label: Label) -> bool {  
         // println!("Adding label id {} at node {}", label.id, label.node_id);
@@ -373,31 +357,6 @@ impl FinalRoutesData {
         }
         self.labels.push(label); // Add the label to the labels vector
         true
-    }
-
-    fn get_label_ids_by_node(&self, node_id: usize) -> Vec<usize> {
-        self.visited[node_id].values().flatten().map(|id| *id).collect()
-    }
-
-    // fn get_label_ids_by_node_covered(&self, node_id: usize, covered: &CoverSet) -> Vec<usize> {
-    //     let result = self.visited[node_id].get(&covered.covered);
-    //     if result.is_some() {
-    //         result.unwrap().clone()
-    //     } else {    
-    //         vec![]
-    //     }
-    // }
-
-    // fn get_finished_labels(&self) -> Vec<Label> {
-    //     self.depot_labels.iter().map(|id| self.labels[*id]).collect()
-    // }
-    
-    fn print_visited_info(&self) {
-        println!("Visited info:");
-        println!("  Cut in: {}", self.cut_in);
-        println!("  Cut out: {}", self.cut_out);
-        println!("  Better labels: {}", self.better);
-        println!("  Total labels: {}", self.labels.len());
     }
 
     fn num_labels(&self) -> usize {

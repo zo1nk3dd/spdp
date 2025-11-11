@@ -25,7 +25,7 @@ fn main() {
 
     let mut model = ColGenModel::new(data.clone());
 
-    let (mut zlb, vlb, mut v_guess, vehicle_lbs, mut cost_lbs, mut final_labels, mut route_arcs) = model.solve(verbose);
+    let (mut zlb, vlb, mut v_guess, vehicle_lbs, mut cost_lbs, final_labels, mut route_arcs) = model.solve(verbose);
 
     let cg_solve_time = start.elapsed();
 
